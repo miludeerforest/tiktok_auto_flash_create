@@ -5,7 +5,7 @@ import sys
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from typing import TypedDict
 
 import flashsale_runner as runner
@@ -170,6 +170,7 @@ class App:
         self.ready_hint_var = tk.StringVar(value="正在准备界面…")
         self._active_notifications: list[tk.Toplevel] = []
         self._last_notification_key = ""
+        self._active_modal: tk.Toplevel | None = None
 
         self._startup_cleanup_count = runner.cleanup_runtime_artifacts()
         self.cfg = load_cfg()
@@ -397,8 +398,105 @@ class App:
         if duration_ms > 0:
             toast.after(duration_ms, lambda ref=toast: self._remove_notification(ref))
 
+    def _show_modal_prompt(self, title: str, message: str, tone: str = "info", dedupe_key: str | None = None):
+        if self._active_modal is not None:
+            try:
+                self._active_modal.destroy()
+            except tk.TclError:
+                pass
+            self._active_modal = None
+
+        palette = self.notification_tones.get(tone, self.notification_tones["info"])
+        modal = tk.Toplevel(self.root)
+        modal.withdraw()
+        modal.transient(self.root)
+        modal.grab_set()
+        modal.title(title)
+        modal.configure(bg=palette["border"])
+        modal.resizable(False, False)
+        modal.protocol("WM_DELETE_WINDOW", lambda ref=modal: self._close_modal_prompt(ref))
+
+        shell = tk.Frame(modal, bg=palette["bg"], bd=0, highlightthickness=0)
+        shell.pack(fill="both", expand=True, padx=1, pady=1)
+
+        tk.Label(
+            shell,
+            text=title,
+            bg=palette["bg"],
+            fg=palette["title"],
+            font=("Microsoft YaHei", 11, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(16, 10))
+
+        body = tk.Text(
+            shell,
+            height=10,
+            width=52,
+            wrap="word",
+            bg=palette["bg"],
+            fg=palette["text"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=0,
+            font=("Microsoft YaHei", 9),
+        )
+        body.insert("1.0", message)
+        body.configure(state="disabled")
+        body.pack(fill="both", expand=True, padx=0, pady=(0, 12))
+
+        footer = tk.Frame(shell, bg=palette["bg"])
+        footer.pack(fill="x", padx=18, pady=(0, 16))
+        tk.Button(
+            footer,
+            text="知道了",
+            command=lambda ref=modal: self._close_modal_prompt(ref),
+            bg=self.colors["accent"],
+            fg="#FFFFFF",
+            activebackground="#1D4ED8",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=8,
+            cursor="hand2",
+            font=("Microsoft YaHei", 9, "bold"),
+        ).pack(side="right")
+
+        modal.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        modal_w = modal.winfo_width()
+        modal_h = modal.winfo_height()
+        x = root_x + max(0, (root_w - modal_w) // 2)
+        y = root_y + max(0, (root_h - modal_h) // 2)
+        modal.geometry(f"+{x}+{y}")
+        modal.deiconify()
+        self._active_modal = modal
+        self._last_notification_key = dedupe_key or f"modal:{tone}:{title}:{' '.join(message.split())}"
+
+    def _close_modal_prompt(self, modal: tk.Toplevel):
+        try:
+            modal.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            modal.destroy()
+        except tk.TclError:
+            pass
+        if self._active_modal is modal:
+            self._active_modal = None
+
+    def _notify(self, title: str, message: str, tone: str = "info", blocking: bool = False, duration_ms: int = 12000, dedupe_key: str | None = None):
+        if blocking:
+            self._schedule_ui(lambda: self._show_modal_prompt(title, message, tone=tone, dedupe_key=dedupe_key))
+        else:
+            self._schedule_ui(lambda: self._show_notification(title, message, tone=tone, duration_ms=duration_ms, dedupe_key=dedupe_key))
+
     def _notify_manual_attention(self, title: str, message: str, tone: str = "warning", duration_ms: int = 15000, dedupe_key: str | None = None):
-        self._schedule_ui(lambda: self._show_notification(title, message, tone=tone, duration_ms=duration_ms, dedupe_key=dedupe_key))
+        self._notify(title, message, tone=tone, blocking=False, duration_ms=duration_ms, dedupe_key=dedupe_key)
 
     def _maybe_notify_for_log_line(self, line: str):
         text = str(line or "").strip()
@@ -781,17 +879,23 @@ class App:
             invalid_text = "\n".join(f"- {item}" for item in invalid)
             self._log("配置未保存：存在无法解析的参考活动名称。")
             self._set_status("参考活动格式有误", "danger")
-            messagebox.showerror(
+            self._notify(
                 "参考活动格式错误",
                 "以下参考活动名称无法解析，请按“前缀-YYYY-M.D-HH:MM”格式填写：\n" + invalid_text,
+                tone="danger",
+                blocking=True,
+                dedupe_key="invalid-seed-format",
             )
             return False
         if len(seeds) < 4:
             self._log("配置未保存：参考活动不足 4 条。")
             self._set_status("参考活动不足 4 条", "danger")
-            messagebox.showerror(
+            self._notify(
                 "参考活动不足",
                 "请手动填写 4 条可解析的参考活动名称后再保存/运行。",
+                tone="danger",
+                blocking=True,
+                dedupe_key="seed-count-insufficient",
             )
             return False
         cfg: GuiConfig = {
@@ -808,7 +912,7 @@ class App:
         runner.configure_paths(base_dir)
         self._log("配置已保存。")
         self._set_status("配置已保存", "success")
-        messagebox.showinfo("提示", "配置已保存")
+        self._notify("配置已保存", "当前配置已保存到本地，可直接继续运行。", tone="success", blocking=False, duration_ms=4500, dedupe_key="config-saved")
         return True
 
     def check_cdp_clicked(self):
@@ -820,10 +924,10 @@ class App:
         self._log(info)
         if ok:
             self._set_status("CDP 检测成功", "success")
-            messagebox.showinfo("CDP检测", info)
+            self._notify("CDP 检测成功", info, tone="success", blocking=False, duration_ms=6000, dedupe_key=f"cdp-success:{port}")
         else:
             self._set_status("CDP 检测失败", "danger")
-            messagebox.showerror("CDP检测", info)
+            self._notify("CDP 检测失败", info, tone="danger", blocking=True, dedupe_key=f"cdp-fail:{port}")
 
     def manual_resume_clicked(self):
         with open(MANUAL_FLAG, "w", encoding="utf-8") as f:
@@ -856,7 +960,6 @@ class App:
                 duration_ms=5000,
                 dedupe_key="already-running",
             )
-            messagebox.showwarning("运行中", "已有任务在运行，请先停止。")
             return
 
         port = self._get_selected_port()
@@ -867,7 +970,7 @@ class App:
             self._log("无法开始运行: CDP检测失败")
             self._log(info)
             self._set_status("无法开始运行，请先修复 CDP", "danger")
-            messagebox.showerror("无法运行", info)
+            self._notify("无法开始运行", info, tone="danger", blocking=True, dedupe_key="run-blocked-by-cdp")
             return
 
         if not self.save_config_clicked():
