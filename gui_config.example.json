@@ -6,6 +6,7 @@
     "盈利-2026-3.3-01:30",
     "平本-2026-3.3-02:00"
   ],
+  "auto_solve_captcha": false,
   "ai_provider": "openai",
   "ai_api_key": "",
   "ai_model": "",

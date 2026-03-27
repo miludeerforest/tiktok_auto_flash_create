@@ -1,1066 +1,1063 @@
-"""
-OpenCV-based puzzle slider captcha solver for TikTok Seller Center.
+"""AI-assisted slider captcha solver for TikTok Seller Center."""
 
-Uses multi-strategy approach:
-  Strategy C (Priority): AI Vision (OpenAI / Gemini) gap detection.
-  Strategy A: Template matching (Canny edge + matchTemplate) when both
-              piece image and background image are available.
-  Strategy B: Contour-based gap detection on background-only screenshot.
+from __future__ import annotations
 
-Searches both main page and iframes for captcha elements.
-Falls back gracefully on any failure so caller can use manual resume.
-"""
-
+import json
+import os
 import random
+import re
+import sys
+from dataclasses import dataclass
+from typing import Any, Iterable, cast
 
 import cv2
 import numpy as np
+from playwright.async_api import Frame, Locator, Page
+
+Scope = Page | Frame
+SearchScope = Page | Frame | Locator
+CvImage = Any
 
 
-# ---------------------------------------------------------------------------
-# 1. OpenCV core
-# ---------------------------------------------------------------------------
+Box = dict[str, float]
 
-def _bytes_to_cv(img_bytes: bytes) -> np.ndarray:
-    """Convert raw PNG/JPEG bytes to OpenCV BGR image."""
-    arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+CAPTCHA_CONTAINER_SELECTORS = [
+    '[class*="captcha" i]',
+    '[id*="captcha" i]',
+    '[class*="verify" i]',
+    '[id*="verify" i]',
+    '[class*="secsdk" i]',
+    '[id*="secsdk" i]',
+    '[class*="slider" i]',
+    '[id*="slider" i]',
+    '[class*="geetest" i]',
+    '[id*="geetest" i]',
+]
 
+IMAGE_SELECTORS = [
+    '[class*="captcha" i] img',
+    '[class*="verify" i] img',
+    '[class*="secsdk" i] img',
+    '[class*="slider" i] img',
+    '[class*="captcha" i] canvas',
+    '[class*="verify" i] canvas',
+    '[class*="secsdk" i] canvas',
+    '[class*="slider" i] canvas',
+    'img[class*="captcha" i]',
+    'img[class*="verify" i]',
+    'canvas',
+    'img',
+]
 
-def gap_x_to_drag_distance(gap_x: float) -> float:
-    """
-    TikTok slider uses a NON-LINEAR mapping between gap position and drag distance.
-    Formula from reverse engineering:  y = 14.7585 * x^0.5190 - 3.9874
-    where x = gap coordinate (in image pixels), y = drag distance (in CSS pixels).
-    Error < 1px in most cases.
-    """
-    if gap_x <= 0:
-        return 0.0
-    return 14.7585 * (gap_x ** 0.5190) - 3.9874
+SLIDER_SELECTORS = [
+    '[class*="secsdk" i] [class*="btn" i]',
+    '[class*="secsdk" i] [class*="handle" i]',
+    '[class*="secsdk" i] [class*="handler" i]',
+    '[class*="captcha" i] [class*="btn" i]',
+    '[class*="captcha" i] [class*="handle" i]',
+    '[class*="captcha" i] [class*="handler" i]',
+    '[class*="verify" i] [class*="btn" i]',
+    '[class*="verify" i] [class*="handle" i]',
+    '[class*="verify" i] [class*="handler" i]',
+    '[class*="slider" i] [class*="btn" i]',
+    '[class*="slider" i] [class*="handle" i]',
+    '[class*="slider" i] [class*="handler" i]',
+    '[role="slider"]',
+    '[aria-label*="slider" i]',
+    '[aria-label*="drag" i]',
+]
 
+TRACK_SELECTORS = [
+    '[class*="secsdk" i] [class*="track" i]',
+    '[class*="secsdk" i] [class*="rail" i]',
+    '[class*="secsdk" i] [class*="bar" i]',
+    '[class*="captcha" i] [class*="track" i]',
+    '[class*="captcha" i] [class*="rail" i]',
+    '[class*="captcha" i] [class*="bar" i]',
+    '[class*="verify" i] [class*="track" i]',
+    '[class*="verify" i] [class*="rail" i]',
+    '[class*="verify" i] [class*="bar" i]',
+    '[class*="slider" i] [class*="track" i]',
+    '[class*="slider" i] [class*="rail" i]',
+    '[class*="slider" i] [class*="bar" i]',
+]
 
-def find_gap_by_variance(bg_bytes: bytes) -> float | None:
-    """
-    Strategy F: Column variance analysis for gap detection.
-    
-    The gap area has very different pixel distribution compared to the
-    surrounding natural image - it's typically a solid color fill or
-    semi-transparent overlay, which creates high variance spikes.
-    
-    Uses a sliding window to find the region with highest column variance.
-    Returns gap LEFT EDGE X as absolute pixel position.
-    """
-    bg_img = _bytes_to_cv(bg_bytes)
-    if bg_img is None:
-        return None
-    h, w = bg_img.shape[:2]
-    gray = cv2.cvtColor(bg_img, cv2.COLOR_BGR2GRAY)
-    
-    # Compute per-column variance across all rows
-    col_var = np.var(gray.astype(np.float32), axis=0)
-    
-    # Skip first 25% (puzzle piece zone) and last 5%
-    start_col = int(w * 0.25)
-    end_col = int(w * 0.95)
-    
-    # Use sliding window (~45px, approximate gap width) to find highest variance region
-    window = 45
-    best_score = 0
-    best_col = -1
-    
-    for col in range(start_col, end_col - window):
-        score = float(np.mean(col_var[col:col + window]))
-        if score > best_score:
-            best_score = score
-            best_col = col
-    
-    if best_col < 0:
-        print("  [Variance] No gap found.")
-        return None
-    
-    # Verify: the gap area should have significantly higher variance than surroundings
-    overall_var = float(np.mean(col_var[start_col:end_col]))
-    ratio = best_score / max(overall_var, 1.0)
-    
-    print(f"  [Variance] gap_left={best_col}, score={best_score:.0f}, "
-          f"avg={overall_var:.0f}, ratio={ratio:.2f}")
-    
-    if ratio < 1.2:
-        # Gap variance not significantly different from surroundings
-        print("  [Variance] Variance ratio too low, unreliable.")
-        return None
-    
-    gap_center = best_col + window // 2
-    print(f"  [Variance] gap_left_x={best_col}, gap_center={gap_center}")
-    return float(best_col)
+SUCCESS_TEXT_RE = re.compile(r"verified|success|passed|通过|成功|验证通过", re.I)
+RETRY_TEXT_RE = re.compile(r"try again|retry|failed|incorrect|再试|重试|失败|错误", re.I)
+REFRESH_TEXT_RE = re.compile(r"refresh|reload|再次验证|刷新", re.I)
 
 
-def find_gap_by_yescaptcha(bg_bytes: bytes, client_key: str, img_width: int) -> float | None:
-    """
-    Strategy Y: Use YesCaptcha cloud API to detect gap position.
-    
-    Sends the background image to YesCaptcha's ImageToTextTask.
-    The service (AI + human) identifies the gap X coordinate.
-    Returns gap X as absolute pixel position.
-    """
-    import base64, json, urllib.request, time
-    
-    b64_img = base64.b64encode(bg_bytes).decode('utf-8')
-    
-    # Step 1: Create task
-    create_url = "https://api.yescaptcha.com/createTask"
-    payload = {
-        "clientKey": client_key,
-        "task": {
-            "type": "ImageToTextTaskMuggle",
-            "body": b64_img,
-        }
-    }
-    
+@dataclass(slots=True)
+class SolverConfig:
+    ai_provider: str = "openai"
+    ai_api_key: str = ""
+    ai_model: str = ""
+    ai_base_url: str = ""
+
+
+@dataclass(slots=True)
+class ElementSnapshot:
+    locator: Locator
+    box: Box
+    tag_name: str
+    class_name: str
+
+
+@dataclass(slots=True)
+class CaptchaScene:
+    scope: Scope
+    background: ElementSnapshot
+    piece: ElementSnapshot | None
+    slider: ElementSnapshot
+    track: ElementSnapshot | None
+
+
+@dataclass(slots=True)
+class GapCandidate:
+    strategy: str
+    gap_left_px: float
+    confidence: float
+    piece_aware: bool = False
+    notes: str = ""
+
+
+PIECE_AWARE_STRATEGIES = {"template", "sobel"}
+DETECTOR_STRATEGIES = {"yolo"}
+HEURISTIC_STRATEGIES = {"variance", "contour"}
+AI_STRATEGIES = {"ai"}
+
+
+@dataclass(slots=True)
+class PostDragState:
+    captcha_visible: bool
+    success_visible: bool
+    retry_visible: bool
+
+
+@dataclass(slots=True)
+class DragAttemptResult:
+    success: bool
+    moved_px: float
+    state: PostDragState
+
+
+@dataclass(slots=True)
+class SolverAttemptReport:
+    strategy: str
+    confidence: float
+    gap_left_px: float
+    distances: list[float]
+    success: bool = False
+    final_reason: str = ""
+    last_drag_result: DragAttemptResult | None = None
+
+
+@dataclass(slots=True)
+class SolverOutcome:
+    solved: bool
+    reason: str
+    reports: list[SolverAttemptReport]
+
+
+def _runtime_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_solver_config() -> SolverConfig:
+    config_path = os.path.join(_runtime_base_dir(), "gui_config.json")
+    if not os.path.exists(config_path):
+        return SolverConfig()
     try:
-        req = urllib.request.Request(
-            create_url,
-            data=json.dumps(payload).encode('utf-8'),
-            headers={'Content-Type': 'application/json'}
-        )
-        print("  [YesCaptcha] Creating task...")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode('utf-8'))
-        
-        print(f"  [YesCaptcha] createTask response: {result}")
-        
-        if result.get("errorId", 1) != 0:
-            print(f"  [YesCaptcha] Error: {result.get('errorDescription', 'unknown')}")
-            return None
-        
-        # For Muggle type, result is returned immediately
-        solution = result.get("solution", {})
-        text = solution.get("text", "")
-        task_id = result.get("taskId", "")
-        
-        # If solution available immediately
-        if text:
-            print(f"  [YesCaptcha] Immediate result: '{text}'")
-            # Try to parse as number (gap X coordinate or ratio)
-            try:
-                val = float(text.strip().replace(',', '.'))
-                if val <= 1.0:
-                    # It's a ratio
-                    gap_x = val * img_width
-                else:
-                    # It's a pixel value
-                    gap_x = val
-                print(f"  [YesCaptcha] Parsed gap_x={gap_x:.1f}")
-                return gap_x
-            except ValueError:
-                print(f"  [YesCaptcha] Could not parse '{text}' as number")
-        
-        # Step 2: Poll for result if async
-        if task_id:
-            result_url = "https://api.yescaptcha.com/getTaskResult"
-            for attempt in range(10):
-                time.sleep(2)
-                poll_payload = {"clientKey": client_key, "taskId": task_id}
-                req2 = urllib.request.Request(
-                    result_url,
-                    data=json.dumps(poll_payload).encode('utf-8'),
-                    headers={'Content-Type': 'application/json'}
-                )
-                with urllib.request.urlopen(req2, timeout=15) as resp2:
-                    poll_result = json.loads(resp2.read().decode('utf-8'))
-                
-                status = poll_result.get("status", "")
-                print(f"  [YesCaptcha] Poll #{attempt+1}: status={status}")
-                
-                if status == "ready":
-                    sol = poll_result.get("solution", {})
-                    text = sol.get("text", "")
-                    print(f"  [YesCaptcha] Result: '{text}'")
-                    try:
-                        val = float(text.strip().replace(',', '.'))
-                        if val <= 1.0:
-                            gap_x = val * img_width
-                        else:
-                            gap_x = val
-                        print(f"  [YesCaptcha] Parsed gap_x={gap_x:.1f}")
-                        return gap_x
-                    except ValueError:
-                        print(f"  [YesCaptcha] Could not parse '{text}' as number")
-                        return None
-                elif status == "processing":
-                    continue
-                else:
-                    print(f"  [YesCaptcha] Unexpected status: {poll_result}")
-                    return None
-        
-        return None
-    except Exception as e:
-        print(f"  [YesCaptcha] Error: {e}")
-        return None
+        with open(config_path, "r", encoding="utf-8") as file_obj:
+            raw = json.load(file_obj)
+    except Exception:
+        return SolverConfig()
+    if not isinstance(raw, dict):
+        return SolverConfig()
+    return SolverConfig(
+        ai_provider=str(raw.get("ai_provider", "openai") or "openai").strip() or "openai",
+        ai_api_key=str(raw.get("ai_api_key", "") or "").strip(),
+        ai_model=str(raw.get("ai_model", "") or "").strip(),
+        ai_base_url=str(raw.get("ai_base_url", "") or "").strip(),
+    )
 
 
-def _remove_whitespace(image: np.ndarray) -> np.ndarray:
-    """Crop image to remove surrounding whitespace/transparent areas."""
+def _bytes_to_cv(img_bytes: bytes) -> CvImage | None:
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+    return image
+
+
+def _remove_whitespace(image: CvImage) -> CvImage:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
     coords = cv2.findNonZero(thresh)
     if coords is None:
         return image
-    x, y, w, h = cv2.boundingRect(coords)
-    return image[y:y+h, x:x+w]
+    x, y, width, height = cv2.boundingRect(coords)
+    return image[y:y + height, x:x + width]
 
 
-def find_gap_by_template(bg_bytes: bytes, piece_bytes: bytes) -> float | None:
-    """
-    Strategy A: Template matching (PuzzleCaptchaSolver approach).
-    Returns gap center X as a RATIO (0.0 ~ 1.0) of background width.
-    """
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def gap_x_to_drag_distance(gap_x: float) -> float:
+    if gap_x <= 0:
+        return 0.0
+    return 14.7585 * (gap_x ** 0.5190) - 3.9874
+
+
+def build_drag_distance_candidates(
+    gap_left_px: float,
+    image_width_px: float,
+    background_width_css: float,
+    slider_width_css: float,
+    track_width_css: float | None,
+) -> list[float]:
+    ratio = gap_left_px / max(image_width_px, 1.0)
+    travel_width = background_width_css
+    if track_width_css is not None and track_width_css > 0:
+        travel_width = max(track_width_css - slider_width_css * 0.55, background_width_css * 0.65)
+
+    raw_candidates = [
+        travel_width * ratio,
+        gap_x_to_drag_distance(gap_left_px),
+        background_width_css * ratio,
+    ]
+
+    minimum_travel = min(8.0, max(travel_width, 8.0))
+    maximum_travel = max(travel_width, 24.0)
+    normalized: list[float] = []
+    seen: set[int] = set()
+    for candidate in raw_candidates:
+        rounded = int(round(_clamp(candidate, minimum_travel, maximum_travel)))
+        if rounded in seen:
+            continue
+        seen.add(rounded)
+        normalized.append(float(rounded))
+    return normalized
+
+
+def _filter_valid_gap_candidates(candidates: Iterable[GapCandidate], image_width_px: float) -> list[GapCandidate]:
+    return [item for item in candidates if image_width_px * 0.08 < item.gap_left_px < image_width_px * 0.96]
+
+
+def _candidate_tier(candidate: GapCandidate) -> int:
+    if candidate.strategy in PIECE_AWARE_STRATEGIES or candidate.piece_aware:
+        return 0
+    if candidate.strategy in DETECTOR_STRATEGIES:
+        return 1
+    if candidate.strategy in HEURISTIC_STRATEGIES:
+        return 2
+    if candidate.strategy in AI_STRATEGIES:
+        return 3
+    return 4
+
+
+def _consensus_gap_candidate(piece_candidates: list[GapCandidate], image_width_px: float) -> GapCandidate | None:
+    if len(piece_candidates) < 2:
+        return None
+    tolerance = max(12.0, image_width_px * 0.035)
+    ranked = sorted(piece_candidates, key=lambda item: item.confidence, reverse=True)
+    for index, left in enumerate(ranked):
+        for right in ranked[index + 1 :]:
+            if abs(left.gap_left_px - right.gap_left_px) <= tolerance:
+                merged_gap = (left.gap_left_px + right.gap_left_px) / 2.0
+                merged_confidence = min(0.99, max(left.confidence, right.confidence) + 0.12)
+                return GapCandidate(
+                    strategy=f"consensus:{left.strategy}+{right.strategy}",
+                    gap_left_px=merged_gap,
+                    confidence=merged_confidence,
+                    piece_aware=True,
+                    notes="piece-aware-consensus",
+                )
+    return None
+
+
+def select_gap_candidates(candidates: Iterable[GapCandidate], image_width_px: float, limit: int = 2) -> list[GapCandidate]:
+    valid = _filter_valid_gap_candidates(candidates, image_width_px)
+    if not valid:
+        return []
+
+    piece_candidates = [item for item in valid if _candidate_tier(item) == 0]
+    consensus = _consensus_gap_candidate(piece_candidates, image_width_px)
+
+    selected: list[GapCandidate] = []
+    seen: set[tuple[str, int]] = set()
+
+    def _add(candidate: GapCandidate):
+        key = (candidate.strategy, int(round(candidate.gap_left_px)))
+        if key in seen:
+            return
+        seen.add(key)
+        selected.append(candidate)
+
+    if consensus is not None:
+        _add(consensus)
+
+    for tier in range(5):
+        tier_candidates = [item for item in valid if _candidate_tier(item) == tier]
+        tier_candidates.sort(key=lambda item: item.confidence, reverse=True)
+        for candidate in tier_candidates:
+            _add(candidate)
+            if len(selected) >= limit:
+                return selected
+
+    return selected[:limit]
+
+
+def select_best_gap_candidate(candidates: Iterable[GapCandidate], image_width_px: float) -> GapCandidate | None:
+    selected = select_gap_candidates(candidates, image_width_px, limit=1)
+    return selected[0] if selected else None
+
+
+def _build_drag_path(start_x: float, end_x: float, y: float, steps: int) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for index in range(1, steps + 1):
+        fraction = index / steps
+        if fraction < 0.5:
+            eased = 2 * fraction * fraction
+        else:
+            eased = 1 - ((-2 * fraction + 2) ** 2) / 2
+        current_x = start_x + (end_x - start_x) * eased
+        current_y = y + random.choice([-1.0, 0.0, 0.0, 1.0])
+        points.append((current_x, current_y))
+    return points
+
+
+async def _capture_snapshot(locator: Locator) -> ElementSnapshot | None:
+    try:
+        box = await locator.bounding_box()
+        if not box:
+            return None
+        tag_name = str(await locator.evaluate("el => el.tagName || ''"))
+        class_name = str(await locator.evaluate("el => el.className || ''"))
+        normalized_box: Box = {
+            "x": float(box["x"]),
+            "y": float(box["y"]),
+            "width": float(box["width"]),
+            "height": float(box["height"]),
+        }
+        return ElementSnapshot(locator=locator, box=normalized_box, tag_name=tag_name, class_name=class_name)
+    except Exception:
+        return None
+
+
+async def _iter_container_locators(scope: SearchScope) -> list[Locator]:
+    locators: list[Locator] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for selector in CAPTCHA_CONTAINER_SELECTORS:
+        try:
+            items = scope.locator(selector)
+            count = min(await items.count(), 8)
+        except Exception:
+            continue
+        for index in range(count):
+            item = items.nth(index)
+            try:
+                if not await item.is_visible(timeout=300):
+                    continue
+                box = await item.bounding_box()
+                if not box or box["width"] < 60 or box["height"] < 40:
+                    continue
+                key = (round(box["x"]), round(box["y"]), round(box["width"]), round(box["height"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                locators.append(item)
+            except Exception:
+                continue
+    if locators:
+        return locators
+    return [scope.locator("body").first]
+
+
+def find_gap_by_template(bg_bytes: bytes, piece_bytes: bytes) -> GapCandidate | None:
     bg = _bytes_to_cv(bg_bytes)
     piece = _bytes_to_cv(piece_bytes)
     if bg is None or piece is None:
         return None
 
-    h_bg, w_bg = bg.shape[:2]
+    height_bg, width_bg = bg.shape[:2]
     piece = _remove_whitespace(piece)
-    h_p, w_p = piece.shape[:2]
-
-    if w_p >= w_bg or h_p >= h_bg or w_p < 10 or h_p < 10:
+    height_piece, width_piece = piece.shape[:2]
+    if width_piece >= width_bg or height_piece >= height_bg or width_piece < 10 or height_piece < 10:
         return None
 
     bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
     piece_gray = cv2.cvtColor(piece, cv2.COLOR_BGR2GRAY)
-
     bg_edges = cv2.Canny(bg_gray, 100, 200)
     piece_edges = cv2.Canny(piece_gray, 100, 200)
-
     result = cv2.matchTemplate(bg_edges, piece_edges, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-    if max_val < 0.15:
-        print(f"  [Template] Low confidence: {max_val:.3f}")
+    if max_val < 0.18:
         return None
 
-    gap_center_x = max_loc[0] + w_p / 2
-    ratio = gap_center_x / w_bg
-    print(f"  [Template] Match at x={max_loc[0]}, confidence={max_val:.3f}, ratio={ratio:.3f}")
-    return ratio
+    return GapCandidate(
+        strategy="template",
+        gap_left_px=float(max_loc[0]),
+        confidence=float(max_val),
+        piece_aware=True,
+        notes="edge-template",
+    )
 
 
-def find_gap_by_sobel_multi(bg_bytes: bytes, piece_bytes: bytes) -> float | None:
-    """
-    Strategy E: TikTok-specialized Sobel + CLAHE + multi-method template matching.
-    Based on github.com/Gisnsl/tiktok-captcha-solver PuzzleSolver.
-    Uses Sobel gradient, CLAHE enhancement, and Canny edges with multiple
-    template matching methods, picks the highest confidence result.
-    Returns gap center X as a RATIO (0.0 ~ 1.0) of background width.
-    """
+def find_gap_by_sobel_multi(bg_bytes: bytes, piece_bytes: bytes) -> GapCandidate | None:
     bg = _bytes_to_cv(bg_bytes)
     piece = _bytes_to_cv(piece_bytes)
     if bg is None or piece is None:
         return None
 
-    h_bg, w_bg = bg.shape[:2]
+    height_bg, width_bg = bg.shape[:2]
     piece = _remove_whitespace(piece)
-    h_p, w_p = piece.shape[:2]
-
-    if w_p >= w_bg or h_p >= h_bg or w_p < 10 or h_p < 10:
+    height_piece, width_piece = piece.shape[:2]
+    if width_piece >= width_bg or height_piece >= height_bg or width_piece < 10 or height_piece < 10:
         return None
 
-    def _sobel(img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    def _sobel(image: CvImage) -> CvImage:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
-        ax = cv2.convertScaleAbs(gx)
-        ay = cv2.convertScaleAbs(gy)
-        grad = cv2.addWeighted(ax, 0.5, ay, 0.5, 0)
-        return cv2.normalize(grad, None, 0, 255, cv2.NORM_MINMAX)
+        grad_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+        abs_x = cv2.convertScaleAbs(grad_x)
+        abs_y = cv2.convertScaleAbs(grad_y)
+        grad = cv2.addWeighted(abs_x, 0.5, abs_y, 0.5, 0)
+        return cast(CvImage, cv2.normalize(src=grad, dst=grad.copy(), alpha=0, beta=255, norm_type=cv2.NORM_MINMAX))
 
-    def _enhance(img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    def _enhance(image: CvImage) -> CvImage:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         return clahe.apply(gray)
 
-    def _edges(img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    def _edges(image: CvImage) -> CvImage:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
         return cv2.Canny(blurred, 50, 150)
 
-    def _match_all(a, b):
-        out = []
-        for m in (cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR_NORMED):
-            matched = cv2.matchTemplate(b, a, m)
-            _, mx, _, mx_loc = cv2.minMaxLoc(matched)
-            out.append((mx_loc[0], mx))
-        return out
-
-    def _match_single(a, b):
-        matched = cv2.matchTemplate(b, a, cv2.TM_CCOEFF_NORMED)
-        _, mx, _, mx_loc = cv2.minMaxLoc(matched)
-        return (mx_loc[0], mx)
+    def _match_all(piece_image: CvImage, bg_image: CvImage) -> list[tuple[float, float]]:
+        matches: list[tuple[float, float]] = []
+        for method in (cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR_NORMED):
+            matched = cv2.matchTemplate(bg_image, piece_image, method)
+            _, max_val, _, max_loc = cv2.minMaxLoc(matched)
+            matches.append((float(max_loc[0]), float(max_val)))
+        return matches
 
     try:
-        p_sobel = _sobel(piece)
-        t_sobel = _sobel(bg)
-
-        results = _match_all(p_sobel, t_sobel)
-        results += _match_all(_enhance(piece), _enhance(bg))
-        results.append(_match_single(_edges(piece), _edges(bg)))
-
-        results.sort(key=lambda x: x[1], reverse=True)
-        best_x, best_conf = results[0]
-
-        if best_conf < 0.15:
-            print(f"  [SobelMulti] Low confidence: {best_conf:.3f}")
+        candidates = _match_all(_sobel(piece), _sobel(bg))
+        candidates.extend(_match_all(_enhance(piece), _enhance(bg)))
+        edge_match = cv2.matchTemplate(_edges(bg), _edges(piece), cv2.TM_CCOEFF_NORMED)
+        _, edge_val, _, edge_loc = cv2.minMaxLoc(edge_match)
+        candidates.append((float(edge_loc[0]), float(edge_val)))
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        best_x, best_confidence = candidates[0]
+        if best_confidence < 0.16:
             return None
-
-        gap_center_x = best_x + w_p / 2
-        ratio = gap_center_x / w_bg
-        print(f"  [SobelMulti] Best match x={best_x}, conf={best_conf:.3f}, ratio={ratio:.3f}")
-        return ratio
-    except Exception as e:
-        print(f"  [SobelMulti] Error: {e}")
+        return GapCandidate(
+            strategy="sobel",
+            gap_left_px=best_x,
+            confidence=best_confidence,
+            piece_aware=True,
+            notes="sobel-clahe-multi",
+        )
+    except Exception:
         return None
 
 
-def find_gap_by_contour(img_bytes: bytes) -> float | None:
-    """
-    Strategy B: Contour-based gap detection from single background image.
-    Returns gap center X as a RATIO (0.0 ~ 1.0) of image width.
-    """
-    img = _bytes_to_cv(img_bytes)
-    if img is None:
+def find_gap_by_variance(bg_bytes: bytes) -> GapCandidate | None:
+    bg_img = _bytes_to_cv(bg_bytes)
+    if bg_img is None:
+        return None
+    _, width = bg_img.shape[:2]
+    gray = cv2.cvtColor(bg_img, cv2.COLOR_BGR2GRAY)
+    col_var = np.var(gray.astype(np.float32), axis=0)
+    start_col = int(width * 0.25)
+    end_col = int(width * 0.95)
+    window = 45
+    best_score = 0.0
+    best_col = -1
+    for col in range(start_col, end_col - window):
+        score = float(np.mean(col_var[col:col + window]))
+        if score > best_score:
+            best_score = score
+            best_col = col
+    if best_col < 0:
         return None
 
-    h, w = img.shape[:2]
-    if h < 20 or w < 20:
+    overall_var = float(np.mean(col_var[start_col:end_col]))
+    ratio = best_score / max(overall_var, 1.0)
+    if ratio < 1.2:
+        return None
+    return GapCandidate(
+        strategy="variance",
+        gap_left_px=float(best_col),
+        confidence=min(0.95, ratio / 2.0),
+        notes=f"variance-ratio={ratio:.2f}",
+    )
+
+
+def find_gap_by_contour(img_bytes: bytes) -> GapCandidate | None:
+    image = _bytes_to_cv(img_bytes)
+    if image is None:
+        return None
+    height, width = image.shape[:2]
+    if height < 20 or width < 20:
         return None
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 100, 200)
-
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     dilated = cv2.dilate(edges, kernel, iterations=2)
-
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_x = int(w * 0.3)
-    min_side = int(min(h, w) * 0.08)
-    max_side = int(max(h, w) * 0.45)
-
-    candidates = []
-    for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
+    min_x = int(width * 0.3)
+    min_side = int(min(height, width) * 0.08)
+    max_side = int(max(height, width) * 0.45)
+    candidates: list[tuple[float, float, int]] = []
+    for contour in contours:
+        x, y, contour_width, contour_height = cv2.boundingRect(contour)
         if x < min_x:
             continue
-        if cw < min_side or ch < min_side or cw > max_side or ch > max_side:
+        if contour_width < min_side or contour_height < min_side or contour_width > max_side or contour_height > max_side:
             continue
-        aspect = cw / max(ch, 1)
-        if aspect < 0.5 or aspect > 2.0:
+        aspect = contour_width / max(contour_height, 1)
+        if not 0.5 <= aspect <= 2.0:
             continue
-        roi = edges[y:y+ch, x:x+cw]
-        edge_density = np.count_nonzero(roi) / max(cw * ch, 1)
-        center_x_ratio = (x + cw / 2) / w
-        candidates.append((center_x_ratio, edge_density, x, y, cw, ch))
-
+        roi = edges[y:y + contour_height, x:x + contour_width]
+        edge_density = float(np.count_nonzero(roi) / max(contour_width * contour_height, 1))
+        candidates.append((float(x), edge_density, contour_width))
     if not candidates:
         return None
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    best_x, density, contour_width = candidates[0]
+    return GapCandidate(
+        strategy="contour",
+        gap_left_px=best_x,
+        confidence=min(0.7, density * 2.5),
+        notes=f"width={contour_width}",
+    )
 
-    candidates.sort(key=lambda c: c[1], reverse=True)
-    best = candidates[0]
-    print(f"  [Contour] Gap candidate: x={best[2]}, y={best[3]}, "
-          f"w={best[4]}, h={best[5]}, density={best[1]:.3f}, ratio={best[0]:.3f}")
-    return best[0]
 
-
-def find_gap_by_ai_vision(bg_bytes: bytes, api_key: str, provider: str = 'openai',
-                          model: str = '', piece_bytes: bytes = None,
-                          base_url: str = '') -> float | None:
-    """
-    Strategy C: AI Vision (OpenAI / Gemini) gap detection.
-    Sends background + piece screenshot to vision model.
-    Returns gap center X as a RATIO (0.0 ~ 1.0) of background width.
-    """
-    import base64
-    import re
+def find_gap_by_ai_vision(
+    bg_bytes: bytes,
+    api_key: str,
+    provider: str = "openai",
+    model: str = "",
+    piece_bytes: bytes | None = None,
+    base_url: str = "",
+) -> GapCandidate | None:
+    if not api_key:
+        return None
 
     bg_img = _bytes_to_cv(bg_bytes)
     if bg_img is None:
         return None
-    h, w = bg_img.shape[:2]
+    _, width = bg_img.shape[:2]
 
-    # Prompt: ask for the LEFT EDGE X pixel of the gap/hole only
-    # We send ONLY the background image (not piece), so AI focuses on the gap
-    prompt = (
-        f"This image is a CAPTCHA slider puzzle background, {w} pixels wide.\n"
-        "There is a visible darker GAP or HOLE (a missing puzzle piece shape) in the image.\n"
-        "Return ONLY the integer X pixel coordinate of the LEFT EDGE of the gap/hole, "
-        "measured from the left side of the image.\n"
-        "Just one integer, nothing else. Example: 185"
-    )
+    import base64
+    import io
 
-    # Send ONLY background image (not combined with piece) for cleaner detection
-    send_bytes = bg_bytes
-
-    b64 = base64.b64encode(send_bytes).decode('utf-8')
-    print(f"  [AIVision] provider={provider}, model={model or 'default'}, img={w}x{h}")
+    prompt_lines = [
+        f"This is a slider CAPTCHA background image that is {width} pixels wide.",
+        "Find the LEFT EDGE X coordinate of the missing gap/hole where the puzzle piece should fit.",
+        "Return only one integer pixel coordinate, nothing else.",
+    ]
+    if piece_bytes:
+        prompt_lines.append("A second image may contain the draggable puzzle piece for reference.")
+    prompt = "\n".join(prompt_lines)
+    bg_b64 = base64.b64encode(bg_bytes).decode("utf-8")
 
     try:
-        raw = None
-        if provider == 'openai':
+        raw_text = ""
+        if provider == "openai":
             from openai import OpenAI
-            client_kwargs = {"api_key": api_key}
-            if base_url:
-                client_kwargs["base_url"] = base_url
-            client = OpenAI(**client_kwargs)
-            use_model = model or 'gpt-4o'
+
+            client = OpenAI(api_key=api_key, base_url=base_url or None)
+            content: list[dict[str, object]] = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{bg_b64}"}},
+            ]
+            if piece_bytes:
+                piece_b64 = base64.b64encode(piece_bytes).decode("utf-8")
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{piece_b64}"}})
+            user_message = cast(Any, {"role": "user", "content": content})
             response = client.chat.completions.create(
-                model=use_model,
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{b64}"}}
-                    ]}
-                ],
+                model=model or "gpt-4o",
+                messages=cast(Any, [user_message]),
                 temperature=0,
-                max_tokens=20
+                max_tokens=24,
             )
-            raw = response.choices[0].message.content.strip()
-
-        elif provider == 'gemini':
+            raw_text = (response.choices[0].message.content or "").strip()
+        elif provider == "gemini":
             import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            use_model = model or 'gemini-2.0-flash'
-            gm = genai.GenerativeModel(use_model)
-            import PIL.Image, io
-            img_pil = PIL.Image.open(io.BytesIO(send_bytes))
-            response = gm.generate_content([prompt, img_pil])
-            raw = response.text.strip()
+            from PIL import Image
 
+            genai.configure(api_key=api_key)
+            gemini_model = genai.GenerativeModel(model or "gemini-2.0-flash")
+            payload: list[object] = [prompt, Image.open(io.BytesIO(bg_bytes))]
+            if piece_bytes:
+                payload.append(Image.open(io.BytesIO(piece_bytes)))
+            response = gemini_model.generate_content(payload)
+            raw_text = str(getattr(response, "text", "") or "").strip()
         else:
-            print(f"  [AIVision] Unknown provider: {provider}")
             return None
 
-        print(f"  [AIVision] Raw response: {repr(raw)}")
-        match = re.search(r'\d+', raw)
-        if match:
-            gap_left_x = int(match.group())
-            # Return as ratio of image width (this is the LEFT EDGE of gap)
-            ratio = gap_left_x / w
-            print(f"  [AIVision] gap_left_x={gap_left_x}, ratio={ratio:.3f}")
-            return ratio
-        print(f"  [AIVision] Could not parse integer from response")
+        match = re.search(r"\d+", raw_text)
+        if not match:
+            return None
+        gap_left = float(int(match.group()))
+        if not 0 < gap_left < width:
+            return None
+        return GapCandidate(
+            strategy="ai",
+            gap_left_px=gap_left,
+            confidence=0.58,
+            piece_aware=piece_bytes is not None,
+            notes=f"provider={provider}",
+        )
+    except Exception:
+        return None
 
-    except Exception as e:
-        import traceback
-        print(f"  [AIVision] Request failed: {e}")
-        print(f"  [AIVision] Traceback: {traceback.format_exc()}")
 
-    return None
-
-
-def find_gap_by_yolo(bg_bytes: bytes) -> float | None:
-    """
-    Strategy D: YOLO-based gap detection using captcha-recognizer.
-    Uses a pre-trained YOLOv11 ONNX model to detect the gap position.
-    Returns gap center X as a RATIO (0.0 ~ 1.0) of background width.
-    """
+def find_gap_by_yolo(bg_bytes: bytes) -> GapCandidate | None:
     try:
         from captcha_recognizer.slider import Slider
     except ImportError:
-        print("  [YOLO] captcha-recognizer not installed. Skip.")
         return None
 
     bg_img = _bytes_to_cv(bg_bytes)
     if bg_img is None:
         return None
-    h, w = bg_img.shape[:2]
+    _, width = bg_img.shape[:2]
 
     try:
         model = Slider()
-        box, conf = model.identify(source=bg_img, show=False)
-        print(f"  [YOLO] box={box}, conf={conf:.3f}")
-
-        if not box or conf < 0.3:
-            print(f"  [YOLO] No gap detected or low confidence.")
+        box, confidence = model.identify(source=bg_img, show=False)
+        if not box or confidence < 0.3:
             return None
-
-        x1, y1, x2, y2 = box[:4]
-        
-        # Filter: if box is too close to the left edge (< 10% of width),
-        # it's likely the puzzle piece, not the gap.
-        # Record piece_right_edge for dynamic offset calculation.
-        if x1 < w * 0.10:
-            piece_right_edge = x2  # right edge of puzzle piece
-            print(f"  [YOLO] Box too close to left edge (x1={x1:.1f}), puzzle piece. piece_right_edge={piece_right_edge:.1f}")
-            return None, piece_right_edge  # return piece info even though gap not found
-        
-        # Use LEFT EDGE x1 as gap position
-        ratio = x1 / w
-        print(f"  [YOLO] gap_left_x={x1:.1f}, ratio={ratio:.3f}")
-        return ratio, None  # gap found, no separate piece detection
-
-    except Exception as e:
-        import traceback
-        print(f"  [YOLO] Error: {e}")
-        print(f"  [YOLO] {traceback.format_exc()}")
+        x1, _, _, _ = box[:4]
+        if x1 < width * 0.10:
+            return None
+        return GapCandidate(
+            strategy="yolo",
+            gap_left_px=float(x1),
+            confidence=float(confidence),
+            notes="captcha-recognizer",
+        )
+    except Exception:
         return None
 
 
-# ---------------------------------------------------------------------------
-# 2. Playwright element finders — search main page + all iframes
-# ---------------------------------------------------------------------------
-
-async def _search_frames(page, finder_fn):
-    """
-    Run finder_fn on main page first, then on each iframe frame.
-    Returns the first non-None result and the frame it was found in.
-    """
-    # Try main page first
-    result = await finder_fn(page)
-    if result is not None:
-        return result, page
-
-    # Try each iframe/frame
-    for frame in page.frames:
-        if frame == page.main_frame:
-            continue
+async def _first_visible_snapshot(scope: SearchScope, selectors: list[str], min_width: float = 24, min_height: float = 20) -> ElementSnapshot | None:
+    best: ElementSnapshot | None = None
+    best_area = 0.0
+    for selector in selectors:
         try:
-            result = await finder_fn(frame)
-            if result is not None:
-                return result, frame
+            items = scope.locator(selector)
+            count = min(await items.count(), 8)
         except Exception:
             continue
-
-    return None, None
-
-
-async def _find_images_in(scope):
-    """Find captcha image(s) within a given page or frame scope."""
-    selectors = [
-        '[class*="captcha" i] img',
-        '[class*="verify" i] img',
-        '[class*="secsdk" i] img',
-        '[class*="slider" i] img',
-        'img[class*="captcha" i]',
-        'img[class*="verify" i]',
-        'canvas',
-        'img',
-    ]
-
-    all_imgs = []
-    seen_srcs = set()
-    for sel in selectors:
-        try:
-            items = scope.locator(sel)
-            count = await items.count()
-            for i in range(count):
-                loc = items.nth(i)
-                try:
-                    if not await loc.is_visible(timeout=300):
-                        continue
-                except Exception:
+        for index in range(count):
+            locator = items.nth(index)
+            try:
+                if not await locator.is_visible(timeout=250):
                     continue
-                box = await loc.bounding_box()
-                if not box or box["width"] < 30 or box["height"] < 30:
-                    continue
-                # Deduplicate by position
-                key = f"{round(box['x'])}_{round(box['y'])}_{round(box['width'])}"
-                if key in seen_srcs:
-                    continue
-                seen_srcs.add(key)
-                all_imgs.append((loc, box))
-        except Exception:
-            continue
-
-    if not all_imgs:
-        return None
-
-    # Sort by area descending — largest is likely the background
-    all_imgs.sort(key=lambda x: x[1]["width"] * x[1]["height"], reverse=True)
-
-    bg = all_imgs[0]
-    piece = None
-    if len(all_imgs) >= 2:
-        bg_area = bg[1]["width"] * bg[1]["height"]
-        p = all_imgs[1]
-        p_area = p[1]["width"] * p[1]["height"]
-        if p_area < bg_area * 0.5:
-            piece = p
-
-    return {"bg": bg, "piece": piece}
-
-
-async def _find_slider_in(scope):
-    """Find slider button within a given page or frame scope.
-    
-    IMPORTANT: The slider handle must be large enough to be draggable (>= 28px).
-    Elements smaller than 28px are likely icons inside the handle, not the handle itself.
-    When a small element is found, we try to use its PARENT as the actual handle.
-    """
-    selectors = [
-        # Specific captcha slider selectors
-        '[class*="secsdk" i] [class*="btn" i]',
-        '[class*="secsdk" i] [class*="icon" i]',
-        '[class*="secsdk" i] [class*="handler" i]',
-        '[class*="secsdk" i] [class*="handle" i]',
-        '[class*="captcha" i] [class*="btn" i]',
-        '[class*="captcha" i] [class*="handler" i]',
-        '[class*="captcha" i] [class*="handle" i]',
-        '[class*="verify" i] [class*="btn" i]',
-        '[class*="verify" i] [class*="handler" i]',
-        '[class*="verify" i] [class*="handle" i]',
-        '[class*="slider" i] [class*="btn" i]',
-        '[class*="slider" i] [class*="icon" i]',
-        '[class*="slider" i] [class*="handler" i]',
-        '[class*="slider" i] [class*="handle" i]',
-        # Generic drag/slide elements
-        '[class*="drag" i]',
-        '[class*="slide" i]:not([class*="slider" i])',
-        # Role/aria selectors
-        '[role="slider"]',
-        '[aria-label*="slider" i]',
-        '[aria-label*="drag" i]',
-        '[aria-label*="slide" i]',
-    ]
-    
-    best_candidate = None
-    best_area = 0
-    
-    for sel in selectors:
-        try:
-            loc = scope.locator(sel).first
-            if not await loc.is_visible(timeout=300):
+            except Exception:
                 continue
-            box = await loc.bounding_box()
-            if not box:
+            snapshot = await _capture_snapshot(locator)
+            if snapshot is None:
                 continue
-                
-            # Get element info for diagnostics
-            tag = await loc.evaluate("el => el.tagName")
-            cls = await loc.evaluate("el => el.className || ''")
-            w, h = box["width"], box["height"]
-            
-            # Skip elements that are way too large (probably containers)
-            if w > 200 or h > 200:
+            width = snapshot.box["width"]
+            height = snapshot.box["height"]
+            if width < min_width or height < min_height:
                 continue
-            
-            # If element is too SMALL (< 28px), it's likely an icon INSIDE the handle.
-            # Try its parent element instead.
-            if w < 28 or h < 28:
-                print(f"  [SliderFind] Skipping small element: {tag}.{cls[:40]} ({w:.0f}x{h:.0f}), trying parent...")
-                try:
-                    parent = scope.locator(f"{sel} >> xpath=..")
-                    if await parent.first.is_visible(timeout=300):
-                        p_box = await parent.first.bounding_box()
-                        if p_box and p_box["width"] >= 28 and p_box["height"] >= 20 and p_box["width"] < 200:
-                            p_tag = await parent.first.evaluate("el => el.tagName")
-                            p_cls = await parent.first.evaluate("el => el.className || ''")
-                            print(f"  [SliderFind] Using parent: {p_tag}.{p_cls[:40]} ({p_box['width']:.0f}x{p_box['height']:.0f})")
-                            area = p_box["width"] * p_box["height"]
-                            if area > best_area:
-                                best_candidate = parent.first
-                                best_area = area
-                            continue
-                except Exception:
-                    pass
+            if width > 260 or height > 240:
                 continue
-            
-            # Good candidate: not too small, not too large
-            area = w * h
+            area = width * height
             if area > best_area:
-                print(f"  [SliderFind] Candidate: {tag}.{cls[:40]} ({w:.0f}x{h:.0f})")
-                best_candidate = loc
+                best = snapshot
                 best_area = area
-                
-        except Exception:
-            continue
-    
-    return best_candidate
+    return best
 
 
-async def _find_track_in(scope):
-    """Find slider track within a given page or frame scope."""
-    selectors = [
-        '[class*="secsdk" i] [class*="track" i]',
-        '[class*="secsdk" i] [class*="bar" i]',
-        '[class*="secsdk" i] [class*="rail" i]',
-        '[class*="captcha" i] [class*="track" i]',
-        '[class*="captcha" i] [class*="bar" i]',
-        '[class*="verify" i] [class*="track" i]',
-        '[class*="slider" i] [class*="track" i]',
-        '[class*="slider" i] [class*="bar" i]',
-        '[class*="slider" i] [class*="rail" i]',
-    ]
-    for sel in selectors:
+def _boxes_overlap(a: Box, b: Box, padding: float = 0.0) -> bool:
+    ax1 = a["x"] - padding
+    ay1 = a["y"] - padding
+    ax2 = a["x"] + a["width"] + padding
+    ay2 = a["y"] + a["height"] + padding
+    bx1 = b["x"] - padding
+    by1 = b["y"] - padding
+    bx2 = b["x"] + b["width"] + padding
+    by2 = b["y"] + b["height"] + padding
+    return ax1 <= bx2 and ax2 >= bx1 and ay1 <= by2 and ay2 >= by1
+
+
+def _score_background_candidate(candidate: ElementSnapshot, slider: ElementSnapshot | None, track: ElementSnapshot | None) -> float:
+    area = candidate.box["width"] * candidate.box["height"]
+    score = area
+    reference = track or slider
+    if reference is not None:
+        center_y = candidate.box["y"] + candidate.box["height"] / 2
+        ref_center_y = reference.box["y"] + reference.box["height"] / 2
+        vertical_delta = abs(center_y - ref_center_y)
+        score -= vertical_delta * 4.0
+        if _boxes_overlap(candidate.box, reference.box, padding=24.0):
+            score += 15000.0
+        if candidate.box["x"] <= reference.box["x"] + reference.box["width"] and candidate.box["width"] >= reference.box["width"] * 1.2:
+            score += 8000.0
+    return score
+
+
+def _is_piece_candidate(candidate: ElementSnapshot, background: ElementSnapshot) -> bool:
+    candidate_area = candidate.box["width"] * candidate.box["height"]
+    background_area = background.box["width"] * background.box["height"]
+    if candidate_area >= background_area * 0.55:
+        return False
+    if candidate.box["width"] >= background.box["width"] * 0.65:
+        return False
+    if candidate.box["height"] >= background.box["height"] * 0.85:
+        return False
+    return _boxes_overlap(candidate.box, background.box, padding=36.0)
+
+
+def _scene_geometry_is_plausible(background: ElementSnapshot, slider: ElementSnapshot, track: ElementSnapshot | None) -> bool:
+    bg = background.box
+    slider_box = slider.box
+    reference = track.box if track is not None else slider_box
+
+    if bg["width"] < slider_box["width"] * 1.4:
+        return False
+    if bg["height"] < slider_box["height"] * 0.8:
+        return False
+    if bg["x"] > slider_box["x"] + slider_box["width"]:
+        return False
+    if bg["x"] + bg["width"] < reference["x"] + reference["width"] * 0.6:
+        return False
+
+    bg_center_y = bg["y"] + bg["height"] / 2
+    ref_center_y = reference["y"] + reference["height"] / 2
+    allowed_vertical_delta = max(bg["height"], reference["height"]) * 1.25
+    return abs(bg_center_y - ref_center_y) <= allowed_vertical_delta
+
+
+async def _find_images_in(
+    scope: SearchScope,
+    slider: ElementSnapshot | None = None,
+    track: ElementSnapshot | None = None,
+) -> tuple[ElementSnapshot, ElementSnapshot | None] | None:
+    image_snapshots: list[ElementSnapshot] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for selector in IMAGE_SELECTORS:
         try:
-            loc = scope.locator(sel).first
-            if await loc.is_visible(timeout=300):
-                return loc
+            items = scope.locator(selector)
+            count = min(await items.count(), 12)
         except Exception:
             continue
+        for index in range(count):
+            locator = items.nth(index)
+            try:
+                if not await locator.is_visible(timeout=250):
+                    continue
+            except Exception:
+                continue
+            snapshot = await _capture_snapshot(locator)
+            if snapshot is None:
+                continue
+            width = snapshot.box["width"]
+            height = snapshot.box["height"]
+            if width < 30 or height < 30:
+                continue
+            key = (round(snapshot.box["x"]), round(snapshot.box["y"]), round(width), round(height))
+            if key in seen:
+                continue
+            seen.add(key)
+            image_snapshots.append(snapshot)
+
+    if not image_snapshots:
+        return None
+
+    image_snapshots.sort(key=lambda item: _score_background_candidate(item, slider, track), reverse=True)
+    background = image_snapshots[0]
+    piece: ElementSnapshot | None = None
+    for candidate in image_snapshots[1:]:
+        if _is_piece_candidate(candidate, background):
+            piece = candidate
+            break
+    return background, piece
+
+
+async def _extract_scene_from_scope(scope: Scope) -> CaptchaScene | None:
+    slider = await _first_visible_snapshot(scope, SLIDER_SELECTORS)
+    if slider is None:
+        return None
+    track = await _first_visible_snapshot(scope, TRACK_SELECTORS, min_width=60, min_height=10)
+    images = await _find_images_in(scope, slider=slider, track=track)
+    if images is None:
+        return None
+    background, piece = images
+    if not _scene_geometry_is_plausible(background, slider, track):
+        return None
+    return CaptchaScene(scope=scope, background=background, piece=piece, slider=slider, track=track)
+
+
+async def _find_captcha_scene(page: Page) -> CaptchaScene | None:
+    scope_candidates: list[Scope] = [page]
+    scope_candidates.extend(frame for frame in page.frames if frame != page.main_frame)
+
+    for scope in scope_candidates:
+        for container in await _iter_container_locators(scope):
+            try:
+                slider = await _first_visible_snapshot(container, SLIDER_SELECTORS)
+                if slider is None:
+                    continue
+                track = await _first_visible_snapshot(container, TRACK_SELECTORS, min_width=60, min_height=10)
+                images = await _find_images_in(container, slider=slider, track=track)
+                if images is None:
+                    continue
+                background, piece = images
+                if not _scene_geometry_is_plausible(background, slider, track):
+                    continue
+                return CaptchaScene(scope=scope, background=background, piece=piece, slider=slider, track=track)
+            except Exception:
+                continue
+
+        fallback_scene = await _extract_scene_from_scope(scope)
+        if fallback_scene is not None:
+            return fallback_scene
     return None
 
 
-# ---------------------------------------------------------------------------
-# 3. Main solver
-# ---------------------------------------------------------------------------
+async def _read_image_bytes(snapshot: ElementSnapshot | None) -> bytes | None:
+    if snapshot is None:
+        return None
+    try:
+        return await snapshot.locator.screenshot(type="png")
+    except Exception:
+        return None
 
-async def solve_slider_captcha(page, max_attempts: int = 3) -> bool:
-    """
-    Attempt to automatically solve a puzzle slider captcha.
-    Searches both main page and iframes for captcha elements.
 
-    Returns True if captcha was solved, False otherwise.
-    """
-    for attempt in range(max_attempts):
-        print(f"  Auto-solve attempt {attempt + 1}/{max_attempts}...")
+async def _detect_gap_candidates(scene: CaptchaScene, config: SolverConfig) -> tuple[list[GapCandidate], float]:
+    bg_bytes = await _read_image_bytes(scene.background)
+    piece_bytes = await _read_image_bytes(scene.piece)
+    if not bg_bytes:
+        return [], scene.background.box["width"]
 
+    bg_image = _bytes_to_cv(bg_bytes)
+    image_width = float(bg_image.shape[1]) if bg_image is not None else float(scene.background.box["width"])
+    candidates: list[GapCandidate] = []
+
+    if piece_bytes:
+        for detector in (find_gap_by_template, find_gap_by_sobel_multi):
+            candidate = detector(bg_bytes, piece_bytes)
+            if candidate is not None:
+                candidates.append(candidate)
+
+    for detector in (find_gap_by_variance, find_gap_by_yolo, find_gap_by_contour):
+        candidate = detector(bg_bytes)
+        if candidate is not None:
+            candidates.append(candidate)
+
+    if config.ai_api_key:
+        candidate = find_gap_by_ai_vision(
+            bg_bytes,
+            api_key=config.ai_api_key,
+            provider=config.ai_provider,
+            model=config.ai_model,
+            piece_bytes=piece_bytes,
+            base_url=config.ai_base_url,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates, image_width
+
+
+async def _read_post_drag_state(scene: CaptchaScene) -> PostDragState:
+    try:
+        body_text = await scene.scope.evaluate("() => document.body ? document.body.innerText || '' : ''")
+    except Exception:
+        body_text = ""
+
+    try:
+        slider_visible = await scene.slider.locator.is_visible(timeout=250)
+    except Exception:
+        slider_visible = False
+
+    try:
+        background_visible = await scene.background.locator.is_visible(timeout=250)
+    except Exception:
+        background_visible = False
+
+    normalized_text = " ".join(str(body_text or "").split())
+    success_visible = bool(SUCCESS_TEXT_RE.search(normalized_text))
+    retry_visible = bool(RETRY_TEXT_RE.search(normalized_text))
+    captcha_visible = slider_visible or background_visible
+    return PostDragState(
+        captcha_visible=captcha_visible,
+        success_visible=success_visible,
+        retry_visible=retry_visible,
+    )
+
+
+async def _refresh_captcha(scene: CaptchaScene) -> bool:
+    for selector in [
+        'button:has-text("Refresh")',
+        'button:has-text("刷新")',
+        '[role="button"]:has-text("Refresh")',
+        '[role="button"]:has-text("刷新")',
+        '[class*="refresh" i]',
+        '[aria-label*="refresh" i]',
+    ]:
         try:
-            # Step 1: Find captcha images (check main page + iframes)
-            img_result, img_frame = await _search_frames(page, _find_images_in)
-            if not img_result:
-                print("  Could not find captcha image in any frame.")
-                return False
-
-            bg_loc, bg_box = img_result["bg"]
-            piece_info = img_result.get("piece")
-            print(f"  Found captcha image: {bg_box['width']:.0f}x{bg_box['height']:.0f} in {'iframe' if img_frame != page else 'main page'}")
-
-            # Step 2: Find slider button (check all frames)
-            slider_btn, slider_frame = await _search_frames(page, _find_slider_in)
-            if not slider_btn:
-                print("  Could not find slider button in any frame.")
-                return False
-
-            slider_box = await slider_btn.bounding_box()
-            print(f"  Found slider button: {slider_box['width']:.0f}x{slider_box['height']:.0f} "
-                  f"at ({slider_box['x']:.0f},{slider_box['y']:.0f}) "
-                  f"in {'iframe' if slider_frame != page else 'main page'}")
-
-            # Step 3: Screenshot images
-            bg_screenshot = None
-            piece_screenshot = None
-            try:
-                bg_screenshot = await bg_loc.screenshot(type="png")
-            except Exception:
-                pass
-            if not bg_screenshot:
-                print("  Could not screenshot background image.")
-                continue
-
-            if piece_info:
-                try:
-                    piece_screenshot = await piece_info[0].screenshot(type="png")
-                    print(f"  Found piece image: {piece_info[1]['width']:.0f}x{piece_info[1]['height']:.0f}")
-                except Exception:
-                    pass
-            else:
-                print("  No piece image found (single background only)")
-
-            # Step 4: Detect gap position
-            gap_ratio = None
-            
-            # --- DEBUG INFO: Save background image for manual inspection ---
-            try:
-                with open(r"c:\tmp\debug_bg.png", "wb") as f:
-                    f.write(bg_screenshot)
-            except:
-                pass
-
-            # Load AI config once (used by Strategy C first)
-            import json, os, sys
-            if getattr(sys, 'frozen', False):
-                _base_dir = os.path.dirname(sys.executable)
-            else:
-                _base_dir = os.path.dirname(os.path.abspath(__file__))
-            _config_path = os.path.join(_base_dir, "gui_config.json")
-            _ai_api_key = ""
-            _ai_provider = "openai"
-            _ai_model = ""
-            _ai_base_url = ""
-            if os.path.exists(_config_path):
-                try:
-                    _cfg = json.load(open(_config_path, "r", encoding="utf-8"))
-                    _ai_api_key = _cfg.get("ai_api_key", "").strip()
-                    _ai_provider = _cfg.get("ai_provider", "openai").strip()
-                    _ai_model = _cfg.get("ai_model", "").strip()
-                    _ai_base_url = _cfg.get("ai_base_url", "").strip()
-                except Exception:
-                    pass
-            print(f"  [DEBUG] Config: {_config_path}, ai_provider={_ai_provider}, key={'set' if _ai_api_key else 'empty'}")
-
-            # Get screenshot pixel dimensions for coordinate conversion
-            import cv2 as _cv2, numpy as _np
-            _img = _cv2.imdecode(_np.frombuffer(bg_screenshot, _np.uint8), _cv2.IMREAD_UNCHANGED)
-            img_pixel_width = _img.shape[1] if _img is not None else bg_box["width"]
-            
-            # ------- DETECT GAP POSITION (as absolute pixel X in screenshot) --------
-            gap_x_pixel = None  # absolute pixel position in screenshot
-            used_strategy = None
-
-            # Strategy Y (TOP PRIORITY): YesCaptcha cloud API
-            # AI + human recognition - most accurate for complex puzzles
-            YESCAPTCHA_KEY = "bc1ce5b5b67ff2540ea3860060c195f4becd543685295"
-            if YESCAPTCHA_KEY:
-                try:
-                    print("  Trying Strategy Y: YesCaptcha cloud API...")
-                    y_result = find_gap_by_yescaptcha(bg_screenshot, YESCAPTCHA_KEY, img_pixel_width)
-                    if y_result is not None:
-                        gap_x_pixel = y_result
-                        used_strategy = "YesCaptcha"
-                        print(f"  [DEBUG] Strategy Y result: gap_x={gap_x_pixel:.1f}")
-                except Exception as e:
-                    print(f"  [DEBUG] Strategy Y error: {e}")
-
-            # Strategy F: Column variance analysis (local fallback)
-            # Most reliable local method - finds the gap by variance spike
-            if gap_x_pixel is None:
-              try:
-                print("  Trying Strategy F: Column variance analysis...")
-                f_result = find_gap_by_variance(bg_screenshot)
-                if f_result is not None:
-                    gap_x_pixel = f_result
-                    used_strategy = "Variance"
-                    print(f"  [DEBUG] Strategy F result: gap_x={gap_x_pixel}")
-              except Exception as e:
-                print(f"  [DEBUG] Strategy F error: {e}")
-
-            # Strategy D: YOLO (captcha-recognizer)
-            # NOTE: YOLO's identify() often detects the PUZZLE PIECE, not the gap!
-            # Only trust results where x1 > 25% of image width.
-            if gap_x_pixel is None:
-                try:
-                    print("  Trying Strategy D: YOLO (captcha-recognizer)...")
-                    yolo_result = find_gap_by_yolo(bg_screenshot)
-                    if yolo_result is not None:
-                        d_ratio, piece_x2 = yolo_result
-                        if d_ratio is not None:
-                            candidate_x = d_ratio * img_pixel_width
-                            # Only trust if beyond 25% - closer detections are likely the piece
-                            if candidate_x > img_pixel_width * 0.25:
-                                gap_x_pixel = candidate_x
-                                used_strategy = "YOLO"
-                                print(f"  [DEBUG] Strategy D result: gap_x={gap_x_pixel:.1f}")
-                            else:
-                                print(f"  [DEBUG] YOLO x={candidate_x:.1f} too close to left, likely piece. Skipping.")
-                except Exception as e:
-                    print(f"  [DEBUG] Strategy D error: {e}")
-
-            # Strategy C: AI Vision (REMOTE, fallback)
-            if gap_x_pixel is None and _ai_api_key:
-                try:
-                    print(f"  Trying Strategy C: AI Vision ({_ai_provider})...")
-                    c_ratio = find_gap_by_ai_vision(
-                        bg_screenshot, _ai_api_key, _ai_provider, _ai_model,
-                        piece_bytes=piece_screenshot, base_url=_ai_base_url
-                    )
-                    if c_ratio is not None:
-                        gap_x_pixel = c_ratio * img_pixel_width
-                        used_strategy = "AIVision"
-                        print(f"  [DEBUG] Strategy C result: gap_x={gap_x_pixel:.1f}")
-                except Exception as e:
-                    print(f"  [DEBUG] Strategy C error: {e}")
-
-            # Strategy B: Contour detection (last resort)
-            if gap_x_pixel is None:
-                try:
-                    print("  Trying Strategy B: Contour detection...")
-                    b_ratio = find_gap_by_contour(bg_screenshot)
-                    if b_ratio is not None:
-                        gap_x_pixel = b_ratio * img_pixel_width
-                        used_strategy = "Contour"
-                        print(f"  [DEBUG] Strategy B result: gap_x={gap_x_pixel:.1f}")
-                except Exception as e:
-                    print(f"  [DEBUG] Strategy B error: {e}")
-
-            if gap_x_pixel is None:
-                print("  Could not detect gap position with any strategy.")
-                continue
-
-            # ------- CALCULATE DRAG DISTANCE --------
-            # The puzzle piece starts at the LEFT EDGE of the image (x≈0).
-            # When we drag by D pixels, the piece moves D pixels rightward.
-            # So drag_distance = gap_x (how far the piece needs to move).
-            # DO NOT subtract slider_center offset - it only affects where
-            # the mouse starts, not how far the piece needs to travel.
-            
-            gap_ratio = gap_x_pixel / img_pixel_width
-            drag_distance = int(round(gap_ratio * bg_box["width"]))
-            
-            slider_center_x = slider_box["x"] + slider_box["width"] / 2
-            target_y = slider_box["y"] + slider_box["height"] / 2
-            
-            print(f"  [PICK] Using {used_strategy}, gap_x={gap_x_pixel:.1f}px (ratio={gap_ratio:.3f})")
-            print(f"  [CALC] bg_box=({bg_box['x']:.0f},{bg_box['y']:.0f}) {bg_box['width']:.0f}x{bg_box['height']:.0f}")
-            print(f"  [CALC] drag_distance={drag_distance}px (= gap_ratio * bg_width)")
-            print(f"  [CALC] slider_center={slider_center_x:.0f}")
-            
-            if drag_distance <= 5:
-                print(f"  Drag distance too small ({drag_distance}px), skipping.")
-                continue
-
-            # Step 6: Simulate drag using CDP pointer events.
-            
-            # Record position before drag
-            pre_drag_box = await slider_btn.bounding_box()
-            
-            target_x = slider_center_x + drag_distance
-            
-            print(f"  [Drag] Using CDP pointer events...")
-            print(f"  [Drag] From ({slider_center_x:.0f},{target_y:.0f}) -> ({target_x:.0f},{target_y:.0f})")
-            
-            # Use CDP to dispatch pointer events directly, which is more reliable
-            # than page.mouse for captcha sliders
-            cdp = None
-            try:
-                cdp = await page.context.new_cdp_session(page)
-            except Exception:
-                pass
-            
-            if cdp:
-                # Use CDP Input.dispatchMouseEvent with proper pointer attributes
-                await cdp.send("Input.dispatchMouseEvent", {
-                    "type": "mouseMoved",
-                    "x": int(slider_center_x),
-                    "y": int(target_y),
-                    "button": "none",
-                    "pointerType": "mouse",
-                })
-                await page.wait_for_timeout(random.randint(100, 200))
-                
-                await cdp.send("Input.dispatchMouseEvent", {
-                    "type": "mousePressed",
-                    "x": int(slider_center_x),
-                    "y": int(target_y),
-                    "button": "left",
-                    "buttons": 1,
-                    "clickCount": 1,
-                    "pointerType": "mouse",
-                })
-                await page.wait_for_timeout(random.randint(100, 200))
-                
-                # Move in multiple steps to simulate drag
-                steps = max(10, drag_distance // 8)
-                for i in range(1, steps + 1):
-                    frac = i / steps
-                    # Ease-in-out curve
-                    if frac < 0.5:
-                        ease = 2 * frac * frac
-                    else:
-                        ease = 1 - (-2 * frac + 2) ** 2 / 2
-                    
-                    cx = int(slider_center_x + drag_distance * ease)
-                    cy = int(target_y + random.choice([-1, 0, 0, 1]))
-                    
-                    await cdp.send("Input.dispatchMouseEvent", {
-                        "type": "mouseMoved",
-                        "x": cx,
-                        "y": cy,
-                        "button": "left",
-                        "buttons": 1,
-                        "pointerType": "mouse",
-                    })
-                    await page.wait_for_timeout(random.randint(10, 30))
-                
-                # Small overshoot
-                overshoot = random.randint(3, 8)
-                await cdp.send("Input.dispatchMouseEvent", {
-                    "type": "mouseMoved",
-                    "x": int(target_x + overshoot),
-                    "y": int(target_y),
-                    "button": "left",
-                    "buttons": 1,
-                    "pointerType": "mouse",
-                })
-                await page.wait_for_timeout(random.randint(100, 200))
-                
-                # Pull back to target
-                await cdp.send("Input.dispatchMouseEvent", {
-                    "type": "mouseMoved",
-                    "x": int(target_x),
-                    "y": int(target_y),
-                    "button": "left",
-                    "buttons": 1,
-                    "pointerType": "mouse",
-                })
-                await page.wait_for_timeout(random.randint(50, 150))
-                
-                # Release
-                await cdp.send("Input.dispatchMouseEvent", {
-                    "type": "mouseReleased",
-                    "x": int(target_x),
-                    "y": int(target_y),
-                    "button": "left",
-                    "buttons": 0,
-                    "clickCount": 1,
-                    "pointerType": "mouse",
-                })
-                
-                try:
-                    await cdp.detach()
-                except Exception:
-                    pass
-            else:
-                # Fallback: use page.mouse (less reliable)
-                print("  [Drag] CDP unavailable, using page.mouse fallback...")
-                await page.mouse.move(slider_center_x, target_y)
-                await page.wait_for_timeout(random.randint(100, 200))
-                await page.mouse.down()
-                await page.wait_for_timeout(random.randint(100, 200))
-                
-                steps = max(10, drag_distance // 8)
-                cx, cy = slider_center_x, target_y
-                for i in range(1, steps + 1):
-                    frac = i / steps
-                    if frac < 0.5:
-                        ease = 2 * frac * frac
-                    else:
-                        ease = 1 - (-2 * frac + 2) ** 2 / 2
-                    cx = slider_center_x + drag_distance * ease
-                    cy = target_y + random.choice([-1, 0, 0, 1])
-                    await page.mouse.move(cx, cy)
-                    await page.wait_for_timeout(random.randint(10, 30))
-                
-                await page.wait_for_timeout(random.randint(80, 200))
-                await page.mouse.up()
-            
-            # Step 7: Verify drag actually moved the slider
-            await page.wait_for_timeout(500)
-            post_drag_box = await slider_btn.bounding_box()
-            if post_drag_box:
-                dx = post_drag_box["x"] - pre_drag_box["x"]
-                print(f"  [Drag] Slider moved: {dx:.0f}px (expected ~{drag_distance}px)")
-                if abs(dx) < 5:
-                    print("  [Drag] WARNING: Slider did NOT move! Events may not be reaching the element.")
-            else:
-                print("  [Drag] Could not verify slider position after drag")
-
-            # Step 8: Check if solved
-            await page.wait_for_timeout(1500)
-
-            from flashsale_runner import detect_slider_captcha
-            still_has = await detect_slider_captcha(page)
-            if not still_has:
-                print("  Auto-solve SUCCESS!")
+            locator = scene.scope.locator(selector).first
+            if await locator.is_visible(timeout=250):
+                await locator.click(timeout=1000)
+                await scene.scope.wait_for_timeout(1200)
                 return True
-            else:
-                print("  Captcha still present after drag. Retrying...")
-                try:
-                    refresh_btn = page.locator(':text("Refresh"), :text("刷新")').first
-                    if await refresh_btn.is_visible(timeout=500):
-                        await refresh_btn.click()
-                        await page.wait_for_timeout(1500)
-                except Exception:
-                    pass
+        except Exception:
+            continue
+    return False
 
-        except Exception as e:
-            import traceback
-            print(f"  Auto-solve error: {e}")
-            print(f"  {traceback.format_exc()}")
+
+async def _perform_drag(scene: CaptchaScene, distance_px: float) -> DragAttemptResult:
+    slider_box_before = await scene.slider.locator.bounding_box()
+    if not slider_box_before:
+        return DragAttemptResult(success=False, moved_px=0.0, state=PostDragState(True, False, False))
+
+    start_x = slider_box_before["x"] + slider_box_before["width"] / 2
+    start_y = slider_box_before["y"] + slider_box_before["height"] / 2
+    end_x = start_x + distance_px
+    steps = max(12, int(abs(distance_px) // 7))
+    drag_path = _build_drag_path(start_x, end_x, start_y, steps)
+
+    owning_page = scene.scope if isinstance(scene.scope, Page) else scene.scope.page
+
+    cdp_session = None
+    try:
+        cdp_session = await owning_page.context.new_cdp_session(owning_page)
+    except Exception:
+        cdp_session = None
+
+    if cdp_session is not None:
+        await cdp_session.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": int(start_x), "y": int(start_y), "button": "none", "pointerType": "mouse"})
+        await scene.scope.wait_for_timeout(random.randint(80, 160))
+        await cdp_session.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": int(start_x), "y": int(start_y), "button": "left", "buttons": 1, "clickCount": 1, "pointerType": "mouse"})
+        await scene.scope.wait_for_timeout(random.randint(90, 180))
+        for current_x, current_y in drag_path:
+            await cdp_session.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": int(current_x), "y": int(current_y), "button": "left", "buttons": 1, "pointerType": "mouse"})
+            await scene.scope.wait_for_timeout(random.randint(10, 24))
+        overshoot = random.randint(3, 7)
+        await cdp_session.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": int(end_x + overshoot), "y": int(start_y), "button": "left", "buttons": 1, "pointerType": "mouse"})
+        await scene.scope.wait_for_timeout(random.randint(70, 130))
+        await cdp_session.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": int(end_x), "y": int(start_y), "button": "left", "buttons": 1, "pointerType": "mouse"})
+        await scene.scope.wait_for_timeout(random.randint(50, 120))
+        await cdp_session.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": int(end_x), "y": int(start_y), "button": "left", "buttons": 0, "clickCount": 1, "pointerType": "mouse"})
+        try:
+            await cdp_session.detach()
+        except Exception:
+            pass
+    else:
+        await owning_page.mouse.move(start_x, start_y)
+        await scene.scope.wait_for_timeout(random.randint(80, 160))
+        await owning_page.mouse.down()
+        await scene.scope.wait_for_timeout(random.randint(90, 180))
+        for current_x, current_y in drag_path:
+            await owning_page.mouse.move(current_x, current_y)
+            await scene.scope.wait_for_timeout(random.randint(10, 24))
+        await scene.scope.wait_for_timeout(random.randint(80, 140))
+        await owning_page.mouse.up()
+
+    await scene.scope.wait_for_timeout(1100)
+    slider_box_after = await scene.slider.locator.bounding_box()
+    moved_px = 0.0
+    if slider_box_after:
+        moved_px = slider_box_after["x"] - slider_box_before["x"]
+    state = await _read_post_drag_state(scene)
+    success = (not state.captcha_visible and not state.retry_visible) or state.success_visible
+    return DragAttemptResult(success=success, moved_px=moved_px, state=state)
+
+
+async def solve_slider_captcha_with_result(page: Page, max_attempts: int = 3) -> SolverOutcome:
+    config = load_solver_config()
+    reports: list[SolverAttemptReport] = []
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"  [Captcha] Auto-solve attempt {attempt}/{max_attempts}...")
+        scene = await _find_captcha_scene(page)
+        if scene is None:
+            print("  [Captcha] No captcha scene found.")
+            return SolverOutcome(solved=False, reason="no_scene", reports=reports)
+
+        gap_candidates, image_width = await _detect_gap_candidates(scene, config)
+        chosen_candidates = select_gap_candidates(gap_candidates, image_width, limit=2)
+        if not chosen_candidates:
+            print("  [Captcha] No usable gap candidate detected.")
+            await scene.scope.wait_for_timeout(900)
+            await _refresh_captcha(scene)
             continue
 
-    print(f"  Auto-solve failed after {max_attempts} attempts.")
-    return False
+        slider_width = scene.slider.box["width"]
+        track_width = scene.track.box["width"] if scene.track else None
+        for chosen in chosen_candidates:
+            distances = build_drag_distance_candidates(
+                gap_left_px=chosen.gap_left_px,
+                image_width_px=image_width,
+                background_width_css=scene.background.box["width"],
+                slider_width_css=slider_width,
+                track_width_css=track_width,
+            )
+            report = SolverAttemptReport(
+                strategy=chosen.strategy,
+                confidence=chosen.confidence,
+                gap_left_px=chosen.gap_left_px,
+                distances=distances,
+            )
+            reports.append(report)
+            print(
+                f"  [Captcha] Strategy={chosen.strategy}, gap_left={chosen.gap_left_px:.1f}px, "
+                f"confidence={chosen.confidence:.2f}, distances={distances}"
+            )
+
+            for distance in distances:
+                drag_result = await _perform_drag(scene, distance)
+                report.last_drag_result = drag_result
+                print(
+                    f"  [Captcha] Drag {distance:.0f}px -> moved={drag_result.moved_px:.1f}px, "
+                    f"captcha_visible={drag_result.state.captcha_visible}, retry_visible={drag_result.state.retry_visible}, "
+                    f"success_visible={drag_result.state.success_visible}"
+                )
+                if drag_result.success:
+                    report.success = True
+                    report.final_reason = "provisional_success"
+                    print("  [Captcha] Auto-solve provisional SUCCESS.")
+                    return SolverOutcome(solved=True, reason="provisional_success", reports=reports)
+
+                moved_px = abs(drag_result.moved_px)
+                if moved_px < max(6.0, slider_width * 0.18):
+                    report.final_reason = "barely_moved"
+                    print("  [Captcha] Slider barely moved; trying next candidate or refresh.")
+                    break
+
+                if drag_result.state.retry_visible:
+                    report.final_reason = "retry_visible"
+                    print("  [Captcha] Retry state detected after drag; trying next candidate or refresh.")
+                    break
+
+            if not report.final_reason:
+                report.final_reason = "candidate_exhausted"
+
+        await _refresh_captcha(scene)
+        await scene.scope.wait_for_timeout(1200)
+
+    print(f"  [Captcha] Auto-solve failed after {max_attempts} attempts.")
+    return SolverOutcome(solved=False, reason="attempts_exhausted", reports=reports)
+
+
+async def solve_slider_captcha(page: Page, max_attempts: int = 3) -> bool:
+    outcome = await solve_slider_captcha_with_result(page, max_attempts=max_attempts)
+    return outcome.solved

@@ -27,6 +27,7 @@ LOG_PATH = os.path.join(base_dir, "gui_run.log")
 class GuiConfig(TypedDict):
     batch_rounds: int
     seed_names: list[str]
+    auto_solve_captcha: bool
     ai_provider: str
     ai_api_key: str
     ai_model: str
@@ -63,6 +64,7 @@ def load_cfg() -> GuiConfig:
                 "盈利-2026-3.3-01:30",
                 "平本-2026-3.3-02:00",
             ],
+            "auto_solve_captcha": False,
             "ai_provider": "openai",
             "ai_api_key": "",
             "ai_model": "",
@@ -73,6 +75,8 @@ def load_cfg() -> GuiConfig:
             cfg = json.load(f)
             if "ai_api_key" not in cfg:
                 cfg["ai_api_key"] = ""
+            if "auto_solve_captcha" not in cfg:
+                cfg["auto_solve_captcha"] = False
             if "ai_provider" not in cfg:
                 cfg["ai_provider"] = "openai"
             if "ai_model" not in cfg:
@@ -82,6 +86,7 @@ def load_cfg() -> GuiConfig:
             return {
                 "batch_rounds": int(cfg.get("batch_rounds", 4)),
                 "seed_names": [str(item).strip() for item in cfg.get("seed_names", ["", "", "", ""])],
+                "auto_solve_captcha": bool(cfg.get("auto_solve_captcha", False)),
                 "ai_provider": str(cfg.get("ai_provider", "openai")),
                 "ai_api_key": str(cfg.get("ai_api_key", "")),
                 "ai_model": str(cfg.get("ai_model", "")),
@@ -91,6 +96,7 @@ def load_cfg() -> GuiConfig:
         return {
             "batch_rounds": 4, 
             "seed_names": ["", "", "", ""], 
+            "auto_solve_captcha": False,
             "ai_provider": "openai",
             "ai_api_key": "",
             "ai_model": "",
@@ -540,6 +546,20 @@ class App:
         ttk.Spinbox(rounds_row, from_=1, to=200, textvariable=self.round_var, width=8).pack(side="left", padx=(10, 8))
         ttk.Label(rounds_row, text="按提交条数计数。建议先用小轮数试跑验证。", style="Hint.TLabel").pack(side="left")
 
+        self.auto_solve_captcha_var = tk.BooleanVar(value=bool(self.cfg.get("auto_solve_captcha", False)))
+        captcha_toggle_row = ttk.Frame(ref_card, style="Card.TFrame")
+        captcha_toggle_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(
+            captcha_toggle_row,
+            text="启用自动验证码处理（默认关闭）",
+            variable=self.auto_solve_captcha_var,
+        ).pack(side="left")
+        ttk.Label(
+            captcha_toggle_row,
+            text="关闭时不走 AI/视觉自动验证，遇到验证码直接人工处理。",
+            style="Hint.TLabel",
+        ).pack(side="left", padx=(10, 0))
+
         ai_card = ttk.LabelFrame(left_panel, text="2. AI 高级设置（可选）", style="Card.TLabelframe", padding=(14, 12))
         ai_card.pack(fill="x")
         ai_card.columnconfigure(1, weight=1)
@@ -770,6 +790,7 @@ class App:
         cfg: GuiConfig = {
             "seed_names": seeds,
             "batch_rounds": int(self.round_var.get()),
+            "auto_solve_captcha": bool(self.auto_solve_captcha_var.get()),
             "ai_provider": self.ai_provider_var.get().strip(),
             "ai_api_key": self.ai_api_key_var.get().strip(),
             "ai_model": self.ai_model_var.get().strip(),
@@ -865,7 +886,11 @@ class App:
         def worker():
             self._log(f"开始运行，轮数={rounds}")
             runner.configure_paths(base_dir)
-            runner.configure_runtime(batch_rounds=rounds, cdp_port_override=port)
+            runner.configure_runtime(
+                batch_rounds=rounds,
+                cdp_port_override=port,
+                auto_solve_captcha_override=bool(self.auto_solve_captcha_var.get()),
+            )
             schedule_ui = self._schedule_ui
             append_log = self._log
             notify_for_line = self._maybe_notify_for_log_line

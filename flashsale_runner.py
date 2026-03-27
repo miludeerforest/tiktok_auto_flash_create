@@ -5,10 +5,13 @@ from collections.abc import Awaitable, Callable
 from typing import TypedDict
 
 solve_slider_captcha: Callable[..., Awaitable[bool]] | None = None
+solve_slider_captcha_with_result: Callable[..., Awaitable[object]] | None = None
 try:
     from captcha_solver import solve_slider_captcha as imported_solve_slider_captcha
+    from captcha_solver import solve_slider_captcha_with_result as imported_solve_slider_captcha_with_result
 
     solve_slider_captcha = imported_solve_slider_captcha
+    solve_slider_captcha_with_result = imported_solve_slider_captcha_with_result
     has_captcha_solver = True
 except ImportError:
     has_captcha_solver = False
@@ -55,6 +58,7 @@ MANAGEMENT_URL = "https://seller-th.tiktok.com/promotion/marketing-tools/managem
 NAME_SUFFIX_LEN = 4
 batch_max_rounds = int(os.getenv("BATCH_MAX_ROUNDS", "60"))
 CAPTCHA_WAIT_SECONDS = 600
+auto_solve_captcha_enabled = False
 checkpoint_file_path = os.path.join(runtime_base_dir, ".schedule_anchor.txt")
 manual_resume_flag_path = os.path.join(runtime_base_dir, ".manual_resume.flag")
 manual_wait_max_seconds = int(os.getenv("MANUAL_WAIT_MAX_SECONDS", "3600"))
@@ -195,14 +199,17 @@ def configure_runtime(
     batch_rounds: int | None = None,
     manual_wait_max_seconds_override: int | None = None,
     cdp_port_override: int | None = None,
+    auto_solve_captcha_override: bool | None = None,
 ):
-    global batch_max_rounds, manual_wait_max_seconds, cdp_port
+    global batch_max_rounds, manual_wait_max_seconds, cdp_port, auto_solve_captcha_enabled
     if batch_rounds is not None:
         batch_max_rounds = int(batch_rounds)
     if manual_wait_max_seconds_override is not None:
         manual_wait_max_seconds = int(manual_wait_max_seconds_override)
     if cdp_port_override is not None:
         cdp_port = int(cdp_port_override)
+    if auto_solve_captcha_override is not None:
+        auto_solve_captcha_enabled = bool(auto_solve_captcha_override)
 
 
 def _debug_screenshots_enabled() -> bool:
@@ -1731,14 +1738,19 @@ async def try_auto_solve_captcha(page, context=None) -> bool:
     Tries on the given page first, then scans all context pages.
     Returns True if captcha was solved.
     """
-    if not has_captcha_solver or solve_slider_captcha is None:
+    if not auto_solve_captcha_enabled:
+        print("Automatic captcha solving is disabled by runtime setting.")
+        return False
+
+    if not has_captcha_solver or solve_slider_captcha_with_result is None:
         print("captcha_solver module not available, skipping auto-solve.")
         return False
 
     # Try on primary page first
     try:
-        solved = await solve_slider_captcha(page)
-        if solved:
+        outcome = await solve_slider_captcha_with_result(page)
+        print(f"Auto-solve provisional outcome on primary page: {getattr(outcome, 'reason', 'unknown')}")
+        if getattr(outcome, 'solved', False):
             return True
     except Exception as e:
         print(f"Auto-solve error on primary page: {e}")
@@ -1751,8 +1763,9 @@ async def try_auto_solve_captcha(page, context=None) -> bool:
             try:
                 from flashsale_runner import detect_slider_captcha
                 if await detect_slider_captcha(pg):
-                    solved = await solve_slider_captcha(pg)
-                    if solved:
+                    outcome = await solve_slider_captcha_with_result(pg)
+                    print(f"Auto-solve provisional outcome on context page: {getattr(outcome, 'reason', 'unknown')}")
+                    if getattr(outcome, 'solved', False):
                         return True
             except Exception:
                 continue
@@ -1980,33 +1993,57 @@ async def main():
                 if shot_path:
                     print(f"DEBUG: captcha screenshot saved: {shot_path}")
 
-                # CAPTCHA detected, wait for manual solve
-                print("CAPTCHA detected. Please solve it manually in browser. Waiting auto-resume...")
-                windows_notify(
-                    "FlashSale 验证码提醒",
-                    f"第{round_idx + 1}轮检测到验证码。请手动完成滑动验证，脚本将自动检测并继续。",
-                )
-                solved = await wait_captcha_resolved_anywhere(context, 30)
-                print("CAPTCHA solved:", solved)
-                if not solved:
-                    # second chance: wait longer window without manual flag
-                    solved = await wait_captcha_resolved_anywhere(context, CAPTCHA_WAIT_SECONDS)
-                    print("CAPTCHA solved after extended wait:", solved)
-                    if not solved:
-                        print("ERROR: CAPTCHA not solved in time. Stop batch.")
-                        break
-                # After manual solve, try submit once more
-                try:
-                    await save_btn.click(timeout=9000)
-                    ok_save = True
-                except Exception:
-                    pass
-                await create_page.wait_for_timeout(2000)
+                auto_solved = False
+                if auto_solve_captcha_enabled:
+                    try:
+                        print("CAPTCHA detected. Attempting automatic solve before manual fallback...")
+                        auto_solved = await try_auto_solve_captcha(create_page, context)
+                        print("CAPTCHA auto-solved:", auto_solved)
+                    except Exception as e:
+                        print(f"ERROR: automatic captcha solve failed with exception: {e}")
+                else:
+                    print("CAPTCHA detected. Automatic solve is disabled; using manual fallback.")
 
-                # captcha solved may be followed by got-it modal
-                dismissed2 = await dismiss_post_submit_guidelines_anywhere(context)
-                if dismissed2:
-                    print("Post-captcha guideline modal dismissed.")
+                if auto_solved:
+                    try:
+                        await save_btn.click(timeout=9000)
+                        ok_save = True
+                    except Exception:
+                        pass
+                    await create_page.wait_for_timeout(2200)
+                    dismissed2 = await dismiss_post_submit_guidelines_anywhere(context)
+                    if dismissed2:
+                        print("Post-auto-solve guideline modal dismissed.")
+                    has_captcha = await detect_slider_captcha_anywhere(context)
+                    if not has_captcha:
+                        print("CAPTCHA fully cleared by auto-solve path.")
+                    else:
+                        print("CAPTCHA still present after auto-solve. Falling back to manual flow.")
+
+                if has_captcha:
+                    print("CAPTCHA detected. Please solve it manually in browser. Waiting auto-resume...")
+                    windows_notify(
+                        "FlashSale 验证码提醒",
+                        f"第{round_idx + 1}轮检测到验证码。请手动完成滑动验证，脚本将自动检测并继续。",
+                    )
+                    solved = await wait_captcha_resolved_anywhere(context, 30)
+                    print("CAPTCHA solved:", solved)
+                    if not solved:
+                        solved = await wait_captcha_resolved_anywhere(context, CAPTCHA_WAIT_SECONDS)
+                        print("CAPTCHA solved after extended wait:", solved)
+                        if not solved:
+                            print("ERROR: CAPTCHA not solved in time. Stop batch.")
+                            break
+                    try:
+                        await save_btn.click(timeout=9000)
+                        ok_save = True
+                    except Exception:
+                        pass
+                    await create_page.wait_for_timeout(2000)
+
+                    dismissed2 = await dismiss_post_submit_guidelines_anywhere(context)
+                    if dismissed2:
+                        print("Post-captcha guideline modal dismissed.")
 
             # if no captcha but got-it modal still visible, keep dismissing briefly
             late_modal = False
