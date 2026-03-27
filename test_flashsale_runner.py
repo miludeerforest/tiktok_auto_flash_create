@@ -76,6 +76,81 @@ def test_choose_from_seed_schedule_prefers_same_prefix_source(tmp_path):
     assert plan["source_prefix"] == "引流"
 
 
+def test_compute_rolling_seed_names_rolls_forward_from_anchor(tmp_path):
+    runner.configure_paths(str(tmp_path))
+    (tmp_path / "gui_config.json").write_text(
+        json.dumps(
+            {
+                "seed_names": [
+                    "引流-2026-3.3-00:30",
+                    "微利-2026-3.3-01:00",
+                    "盈利-2026-3.3-01:30",
+                    "平本-2026-3.3-02:00",
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    rolled = runner.compute_rolling_seed_names(datetime(2026, 3, 3, 2, 30))
+
+    assert rolled == [
+        "引流-2026-3.3-02:30",
+        "微利-2026-3.3-03:00",
+        "盈利-2026-3.3-03:30",
+        "平本-2026-3.3-04:00",
+    ]
+
+
+def test_compute_rolling_seed_names_preserves_anchor_prefix_position(tmp_path):
+    runner.configure_paths(str(tmp_path))
+    (tmp_path / "gui_config.json").write_text(
+        json.dumps(
+            {
+                "seed_names": [
+                    "引流-2026-3.3-00:30",
+                    "微利-2026-3.3-01:00",
+                    "盈利-2026-3.3-01:30",
+                    "平本-2026-3.3-02:00",
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    rolled = runner.compute_rolling_seed_names(datetime(2026, 3, 3, 3, 0))
+
+    assert rolled == [
+        "微利-2026-3.3-03:00",
+        "盈利-2026-3.3-03:30",
+        "平本-2026-3.3-04:00",
+        "引流-2026-3.3-04:30",
+    ]
+
+
+def test_persist_seed_names_writes_gui_config(tmp_path):
+    runner.configure_paths(str(tmp_path))
+    cfg_path = tmp_path / "gui_config.json"
+    cfg_path.write_text(json.dumps({"batch_rounds": 3}, ensure_ascii=False), encoding="utf-8")
+
+    runner.persist_seed_names([
+        "引流-2026-3.3-02:30",
+        "微利-2026-3.3-03:00",
+        "盈利-2026-3.3-03:30",
+        "平本-2026-3.3-04:00",
+    ])
+
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved["seed_names"] == [
+        "引流-2026-3.3-02:30",
+        "微利-2026-3.3-03:00",
+        "盈利-2026-3.3-03:30",
+        "平本-2026-3.3-04:00",
+    ]
+
+
 def test_assess_create_page_product_state_blocks_empty_products():
     result = runner.assess_create_page_product_state(
         {

@@ -728,6 +728,13 @@ class App:
             self._log(f"{reason}已清理 {removed} 张历史截图。")
         return removed
 
+    def _apply_seed_names_update(self, seed_names: list[str]):
+        normalized = (seed_names + ["", "", "", ""])[:4]
+        for var, value in zip(self.seed_vars, normalized):
+            var.set(value)
+        self.cfg["seed_names"] = normalized
+        self._log(f"参考活动已自动同步为：{normalized}")
+
     def on_close(self):
         self._closing = True
         if self._running:
@@ -799,18 +806,6 @@ class App:
         save_cfg(cfg)
         self._log("配置已保存。")
         runner.configure_paths(base_dir)
-        parse_fn = runner.parse_promo_name
-        dts = []
-        for s in seeds:
-            p = parse_fn(s)
-            if p:
-                dts.append(p["dt"])
-        if dts:
-            dtv = max(dts)
-            with open(ANCHOR_FILE, "w", encoding="utf-8") as f:
-                f.write(dtv.strftime("%Y-%m-%d %H:%M"))
-            self._log(f"已保存锚点: {dtv}")
-
         self._log("配置已保存。")
         self._set_status("配置已保存", "success")
         messagebox.showinfo("提示", "配置已保存")
@@ -890,6 +885,7 @@ class App:
                 batch_rounds=rounds,
                 cdp_port_override=port,
                 auto_solve_captcha_override=bool(self.auto_solve_captcha_var.get()),
+                seed_names_update_callback_override=lambda names: schedule_ui(lambda: self._apply_seed_names_update(names)),
             )
             schedule_ui = self._schedule_ui
             append_log = self._log

@@ -63,6 +63,7 @@ NAME_SUFFIX_LEN = 4
 batch_max_rounds = int(os.getenv("BATCH_MAX_ROUNDS", "60"))
 CAPTCHA_WAIT_SECONDS = 600
 auto_solve_captcha_enabled = False
+seed_names_update_callback: Callable[[list[str]], None] | None = None
 checkpoint_file_path = os.path.join(runtime_base_dir, ".schedule_anchor.txt")
 manual_resume_flag_path = os.path.join(runtime_base_dir, ".manual_resume.flag")
 manual_wait_max_seconds = int(os.getenv("MANUAL_WAIT_MAX_SECONDS", "3600"))
@@ -206,8 +207,9 @@ def configure_runtime(
     manual_wait_max_seconds_override: int | None = None,
     cdp_port_override: int | None = None,
     auto_solve_captcha_override: bool | None = None,
+    seed_names_update_callback_override: Callable[[list[str]], None] | None = None,
 ):
-    global batch_max_rounds, manual_wait_max_seconds, cdp_port, auto_solve_captcha_enabled
+    global batch_max_rounds, manual_wait_max_seconds, cdp_port, auto_solve_captcha_enabled, seed_names_update_callback
     if batch_rounds is not None:
         batch_max_rounds = int(batch_rounds)
     if manual_wait_max_seconds_override is not None:
@@ -216,6 +218,8 @@ def configure_runtime(
         cdp_port = int(cdp_port_override)
     if auto_solve_captcha_override is not None:
         auto_solve_captcha_enabled = bool(auto_solve_captcha_override)
+    if seed_names_update_callback_override is not None:
+        seed_names_update_callback = seed_names_update_callback_override
 
 
 def _debug_screenshots_enabled() -> bool:
@@ -1041,6 +1045,65 @@ def load_seed_schedule() -> list[SeedScheduleEntry]:
 
     result.sort(key=lambda x: x["dt"])
     return result
+
+
+def compute_rolling_seed_names(anchor_dt: datetime, seed_count: int = 4) -> list[str]:
+    base_schedule = load_seed_schedule()
+    if not base_schedule:
+        return []
+
+    prefix_cycle = [item["prefix_norm"] for item in base_schedule if item["prefix_norm"]]
+    deduped_cycle: list[str] = []
+    for prefix in prefix_cycle:
+        if prefix not in deduped_cycle:
+            deduped_cycle.append(prefix)
+    if not deduped_cycle:
+        deduped_cycle = ["Seller Flash Sale"]
+
+    start_index = 0
+    base_anchor_dt = base_schedule[0]["dt"]
+    delta_minutes = int((anchor_dt - base_anchor_dt).total_seconds() // 60)
+    slot_offset = max(0, delta_minutes // 30)
+    start_index = slot_offset % len(deduped_cycle)
+
+    cycle_length = len(deduped_cycle)
+    results: list[str] = []
+    for index in range(seed_count):
+        slot_dt = anchor_dt + timedelta(minutes=30 * index)
+        prefix = deduped_cycle[(start_index + index) % cycle_length]
+        stamp = f"{slot_dt.year}-{slot_dt.month}.{slot_dt.day}-{slot_dt.strftime('%H:%M')}"
+        results.append(f"{prefix}-{stamp}")
+    return results
+
+
+def persist_seed_names(seed_names: list[str]):
+    gui_config_path = _gui_config_path()
+    config: dict[str, object] = {}
+    if os.path.exists(gui_config_path):
+        try:
+            import json
+
+            with open(gui_config_path, "r", encoding="utf-8") as file_obj:
+                raw = json.load(file_obj)
+                if isinstance(raw, dict):
+                    config = raw
+        except Exception:
+            config = {}
+
+    config["seed_names"] = seed_names
+    try:
+        import json
+
+        with open(gui_config_path, "w", encoding="utf-8") as file_obj:
+            json.dump(config, file_obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return
+
+    if seed_names_update_callback is not None:
+        try:
+            seed_names_update_callback(seed_names)
+        except Exception:
+            pass
 
 
 def choose_from_seed_schedule(upcoming_rows: list[UpcomingRow]) -> PlanDecision:
@@ -2200,8 +2263,13 @@ async def main():
                 end_time,
             )
 
-            # persist schedule anchor to guarantee "next group" progression
-            save_checkpoint_dt(plan["next_end"])
+            if ok_save:
+                # persist schedule anchor and rolling seed names only after confirmed save progression
+                save_checkpoint_dt(plan["next_end"])
+                new_seed_names = compute_rolling_seed_names(plan["next_end"])
+                if new_seed_names:
+                    persist_seed_names(new_seed_names)
+                    print("Rolling seed names updated:", new_seed_names)
 
             # Continue from current page; next round will force back to management.
             page = create_page
