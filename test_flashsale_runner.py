@@ -83,6 +83,8 @@ def test_assess_create_page_product_state_blocks_empty_products():
             "rowTexts": ["Product Price Stock"],
             "blockTexts": [],
             "emptyTexts": ["No products found"],
+            "productCountTexts": [],
+            "loadingTexts": [],
             "rowCount": 0,
             "blockCount": 0,
         }
@@ -99,6 +101,8 @@ def test_assess_create_page_product_state_accepts_visible_products():
             "rowTexts": ["Product A Price 99 Stock 10"],
             "blockTexts": [],
             "emptyTexts": [],
+            "productCountTexts": [],
+            "loadingTexts": [],
             "rowCount": 1,
             "blockCount": 0,
         }
@@ -107,6 +111,43 @@ def test_assess_create_page_product_state_accepts_visible_products():
     assert result["ok"] is True
     assert result["reason"] == "products_confirmed"
     assert result["visible_product_count"] >= 1
+
+
+def test_assess_create_page_product_state_accepts_positive_product_count():
+    result = runner.assess_create_page_product_state(
+        {
+            "bodyText": "Flash Sale setup 13 product(s)",
+            "rowTexts": [],
+            "blockTexts": [],
+            "emptyTexts": [],
+            "productCountTexts": ["13 product(s)"],
+            "loadingTexts": [],
+            "rowCount": 0,
+            "blockCount": 0,
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "products_confirmed"
+    assert result["visible_product_count"] >= 1
+
+
+def test_assess_create_page_product_state_marks_loading_before_unconfirmed():
+    result = runner.assess_create_page_product_state(
+        {
+            "bodyText": "Loading product list",
+            "rowTexts": [],
+            "blockTexts": [],
+            "emptyTexts": [],
+            "productCountTexts": [],
+            "loadingTexts": ["loading"],
+            "rowCount": 0,
+            "blockCount": 0,
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "products_loading"
 
 
 def test_build_drag_distance_candidates_prefers_unique_positive_values():

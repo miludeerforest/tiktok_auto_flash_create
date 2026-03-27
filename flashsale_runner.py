@@ -51,6 +51,10 @@ ZERO_PRODUCT_PATTERNS = [
 ]
 EMPTY_PRODUCT_RE = re.compile("|".join(f"(?:{p})" for p in EMPTY_PRODUCT_PATTERNS), re.I)
 ZERO_PRODUCT_RE = re.compile("|".join(f"(?:{p})" for p in ZERO_PRODUCT_PATTERNS), re.I)
+POSITIVE_PRODUCT_COUNT_RE = re.compile(
+    r"\b([1-9]\d*)(?:\.0+)?\s*(?:products?|items?|skus?)\b|(?:products?|items?|skus?)\s*[:：]?\s*([1-9]\d*)(?:\.0+)?\b|\b([1-9]\d*)\s*(?:个)?(?:商品|产品)\b|(?:商品|产品)\s*[:：]?\s*([1-9]\d*)(?:\.0+)?\b",
+    re.I,
+)
 TIMESTAMP_RE = re.compile(r"(\d{4})-(\d{1,2})\.(\d{1,2})-(\d{2}:\d{2})")
 
 runtime_base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -179,6 +183,8 @@ class ProductSnapshot(TypedDict):
     rowTexts: list[str]
     blockTexts: list[str]
     emptyTexts: list[str]
+    productCountTexts: list[str]
+    loadingTexts: list[str]
     rowCount: int
     blockCount: int
 
@@ -709,6 +715,8 @@ def assess_create_page_product_state(snapshot: ProductSnapshot) -> ProductState:
     raw_row_texts = snapshot.get("rowTexts") or []
     raw_block_texts = snapshot.get("blockTexts") or []
     raw_empty_texts = snapshot.get("emptyTexts") or []
+    raw_product_count_texts = snapshot.get("productCountTexts") or []
+    raw_loading_texts = snapshot.get("loadingTexts") or []
 
     row_texts = []
     for text in raw_row_texts:
@@ -742,6 +750,27 @@ def assess_create_page_product_state(snapshot: ProductSnapshot) -> ProductState:
         if normalized not in empty_texts:
             empty_texts.append(normalized)
 
+    product_count_hits = []
+    for text in raw_product_count_texts:
+        normalized = _normalize_inline_text(str(text or ""))
+        if not normalized:
+            continue
+        if POSITIVE_PRODUCT_COUNT_RE.search(normalized) and normalized not in product_count_hits:
+            product_count_hits.append(normalized)
+
+    if not product_count_hits:
+        for hit in _extract_regex_hits(body_text, POSITIVE_PRODUCT_COUNT_RE):
+            if hit not in product_count_hits:
+                product_count_hits.append(hit)
+
+    loading_texts = []
+    for text in raw_loading_texts:
+        normalized = _normalize_inline_text(str(text or ""))
+        if not normalized:
+            continue
+        if normalized not in loading_texts:
+            loading_texts.append(normalized)
+
     empty_hits = []
     for source_text in [body_text, *empty_texts]:
         for hit in _extract_regex_hits(source_text, EMPTY_PRODUCT_RE):
@@ -757,7 +786,7 @@ def assess_create_page_product_state(snapshot: ProductSnapshot) -> ProductState:
     row_count = max(0, len(row_texts))
     block_count = max(0, len(block_texts))
     visible_product_count = max(row_count, block_count)
-    has_confirmed_products = visible_product_count > 0
+    has_confirmed_products = visible_product_count > 0 or bool(product_count_hits)
 
     if not has_confirmed_products and empty_hits:
         return {
@@ -781,6 +810,17 @@ def assess_create_page_product_state(snapshot: ProductSnapshot) -> ProductState:
             "block_samples": block_texts[:5],
         }
 
+    if not has_confirmed_products and loading_texts:
+        return {
+            "ok": False,
+            "reason": "products_loading",
+            "visible_product_count": visible_product_count,
+            "empty_hits": empty_hits,
+            "zero_hits": zero_hits,
+            "row_samples": row_texts[:5],
+            "block_samples": block_texts[:5],
+        }
+
     if not has_confirmed_products:
         return {
             "ok": False,
@@ -795,7 +835,7 @@ def assess_create_page_product_state(snapshot: ProductSnapshot) -> ProductState:
     return {
         "ok": True,
         "reason": "products_confirmed",
-        "visible_product_count": visible_product_count,
+        "visible_product_count": max(visible_product_count, len(product_count_hits)),
         "empty_hits": empty_hits,
         "zero_hits": zero_hits,
         "row_samples": row_texts[:5],
@@ -867,6 +907,8 @@ async def inspect_create_page_product_state(page) -> ProductState:
             }
 
             const emptyTexts = [];
+            const productCountTexts = [];
+            const loadingTexts = [];
             const emptySelectors = [
                 '.arco-empty',
                 '.ant-empty',
@@ -884,11 +926,51 @@ async def inspect_create_page_product_state(page) -> ProductState:
                 }
             }
 
+            const loadingSelectors = [
+                '[class*="loading" i]',
+                '[class*="skeleton" i]',
+                '[class*="spin" i]',
+                '[aria-busy="true"]',
+                '[data-testid*="loading"]'
+            ];
+            const scannedLoadingNodes = new Set();
+            for (const selector of loadingSelectors) {
+                for (const node of document.querySelectorAll(selector)) {
+                    if (scannedLoadingNodes.has(node) || !isVisible(node)) continue;
+                    scannedLoadingNodes.add(node);
+                    const text = normalize(node.innerText || '');
+                    loadingTexts.push(text || selector);
+                }
+            }
+
+            const countSelectors = [
+                '[class*="product" i]',
+                '[class*="goods" i]',
+                '[class*="sku" i]',
+                '[data-testid*="product"]',
+                '[data-e2e*="product"]',
+                'span',
+                'div'
+            ];
+            const countRegex = /\b([1-9]\d*)(?:\.0+)?\s*(?:products?|items?|skus?)\b|(?:products?|items?|skus?)\s*[:：]?\s*([1-9]\d*)(?:\.0+)?\b|\b([1-9]\d*)\s*(?:个)?(?:商品|产品)\b|(?:商品|产品)\s*[:：]?\s*([1-9]\d*)(?:\.0+)?\b/i;
+            const scannedCountNodes = new Set();
+            for (const selector of countSelectors) {
+                for (const node of document.querySelectorAll(selector)) {
+                    if (scannedCountNodes.has(node) || !isVisible(node)) continue;
+                    scannedCountNodes.add(node);
+                    const text = normalize(node.innerText || '');
+                    if (!text || !countRegex.test(text)) continue;
+                    productCountTexts.push(text);
+                }
+            }
+
             return {
                 bodyText: document.body ? document.body.innerText || '' : '',
                 rowTexts: dedupe(rowTexts).slice(0, 40),
                 blockTexts: dedupe(blockTexts).slice(0, 40),
                 emptyTexts: dedupe(emptyTexts).slice(0, 20),
+                productCountTexts: dedupe(productCountTexts).slice(0, 20),
+                loadingTexts: dedupe(loadingTexts).slice(0, 20),
                 rowCount: dedupe(rowTexts).length,
                 blockCount: dedupe(blockTexts).length,
             };
@@ -897,7 +979,7 @@ async def inspect_create_page_product_state(page) -> ProductState:
     return assess_create_page_product_state(snapshot)
 
 
-async def wait_for_copied_products(page, attempts: int = 8, delay_ms: int = 900) -> ProductState:
+async def wait_for_copied_products(page, attempts: int = 12, delay_ms: int = 1000) -> ProductState:
     last_state: ProductState = {
         "ok": False,
         "reason": "products_unconfirmed",
@@ -912,6 +994,10 @@ async def wait_for_copied_products(page, attempts: int = 8, delay_ms: int = 900)
         last_state = await inspect_create_page_product_state(page)
         if last_state.get("ok"):
             return last_state
+        if last_state.get("reason") == "products_loading":
+            if idx < attempts - 1:
+                await page.wait_for_timeout(delay_ms + 400)
+            continue
         if last_state.get("reason") in {"empty_products", "zero_products"}:
             consecutive_empty_reads += 1
             if consecutive_empty_reads >= 2:
@@ -919,7 +1005,8 @@ async def wait_for_copied_products(page, attempts: int = 8, delay_ms: int = 900)
         else:
             consecutive_empty_reads = 0
         if idx < attempts - 1:
-            await page.wait_for_timeout(delay_ms)
+            extra_wait = 500 if last_state.get("reason") == "products_unconfirmed" else 0
+            await page.wait_for_timeout(delay_ms + extra_wait)
     return last_state
 
 
